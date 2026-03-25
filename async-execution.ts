@@ -19,10 +19,21 @@ import { buildSkillInjection, normalizeSkillInput, resolveSkills } from "./skill
 import {
 	type ArtifactConfig,
 	type Details,
+	type ExtensionConfig,
 	type MaxOutputConfig,
 	ASYNC_DIR,
 	RESULTS_DIR,
 } from "./types.js";
+import {
+	type CmuxHost,
+	type CmuxPlacement,
+	buildHostedCommand,
+	chooseCmuxPlacement,
+	clipTitle,
+	getCmuxAsyncConfig,
+	launchRunnerInCmux,
+	sendCommandToCmuxHost,
+} from "./cmux-async.js";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -57,6 +68,7 @@ export interface AsyncChainParams {
 	chain: ChainStep[];
 	agents: AgentConfig[];
 	ctx: AsyncExecutionContext;
+	config: ExtensionConfig;
 	cwd?: string;
 	maxOutput?: MaxOutputConfig;
 	artifactsDir?: string;
@@ -72,6 +84,7 @@ export interface AsyncSingleParams {
 	task: string;
 	agentConfig: AgentConfig;
 	ctx: AsyncExecutionContext;
+	config: ExtensionConfig;
 	cwd?: string;
 	maxOutput?: MaxOutputConfig;
 	artifactsDir?: string;
@@ -89,6 +102,30 @@ export interface AsyncExecutionResult {
 	isError?: boolean;
 }
 
+interface RunnerConfigPayload {
+	id: string;
+	steps: RunnerStep[];
+	resultPath: string;
+	cwd: string;
+	placeholder: string;
+	maxOutput?: MaxOutputConfig;
+	artifactsDir?: string;
+	artifactConfig?: ArtifactConfig;
+	share?: boolean;
+	sessionDir?: string;
+	asyncDir: string;
+	sessionId?: string;
+	piPackageRoot?: string;
+	displayLabel?: string;
+	cmuxHost?: CmuxHost;
+	streamToStdout?: boolean;
+}
+
+interface SpawnRunnerResult {
+	pid?: number;
+	cmuxHost?: CmuxHost;
+}
+
 /**
  * Check if jiti is available for async execution
  */
@@ -96,24 +133,72 @@ export function isAsyncAvailable(): boolean {
 	return jitiCliPath !== undefined;
 }
 
+function buildRunnerInvocation(suffix: string): { cfgPath: string; runner: string; nodeArgs: string[] } | null {
+	if (!jitiCliPath) return null;
+	const cfgPath = path.join(os.tmpdir(), `pi-async-cfg-${suffix}.json`);
+	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
+	return { cfgPath, runner, nodeArgs: [jitiCliPath, runner, cfgPath] };
+}
+
+function shQuote(value: string): string {
+	return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function buildRunnerCommand(cwd: string, nodeArgs: string[]): string {
+	const argv = ["node", ...nodeArgs].map((arg) => shQuote(arg)).join(" ");
+	return `cd ${shQuote(cwd)} && ${argv}`;
+}
+
+function inferPlacementHint(cfg: RunnerConfigPayload): CmuxPlacement {
+	const stepCount = cfg.steps.length;
+	if (stepCount > 1) return "workspace";
+	const firstStep = cfg.steps[0];
+	return "parallel" in firstStep ? "workspace" : "split";
+}
+
 /**
  * Spawn the async runner process
  */
-function spawnRunner(cfg: object, suffix: string, cwd: string): number | undefined {
-	if (!jitiCliPath) return undefined;
-	
-	const cfgPath = path.join(os.tmpdir(), `pi-async-cfg-${suffix}.json`);
-	fs.writeFileSync(cfgPath, JSON.stringify(cfg));
-	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
-	
-	const proc = spawn("node", [jitiCliPath, runner, cfgPath], {
+function spawnRunner(cfg: RunnerConfigPayload, suffix: string, cwd: string, config: ExtensionConfig): SpawnRunnerResult {
+	const invocation = buildRunnerInvocation(suffix);
+	if (!invocation) return {};
+
+	fs.writeFileSync(invocation.cfgPath, JSON.stringify(cfg));
+
+	const cmuxConfig = getCmuxAsyncConfig(config);
+	const placement = chooseCmuxPlacement(cmuxConfig, inferPlacementHint(cfg));
+	if (placement) {
+		const title = clipTitle(`π subagent · ${cfg.displayLabel || suffix}`, 80);
+		const cmuxCommand = buildHostedCommand(
+			buildRunnerCommand(cwd, invocation.nodeArgs),
+			title,
+			placement,
+			cmuxConfig.keepShellOpen,
+		);
+		const host = launchRunnerInCmux({
+			placement,
+			title,
+			bin: cmuxConfig.bin,
+			splitDirection: cmuxConfig.splitDirection,
+		});
+		if (host) {
+			const updatedCfg = { ...cfg, cmuxHost: host, streamToStdout: true };
+			fs.writeFileSync(invocation.cfgPath, JSON.stringify(updatedCfg));
+			if (sendCommandToCmuxHost(host, cmuxCommand, cmuxConfig.bin)) {
+				return { cmuxHost: host };
+			}
+			fs.writeFileSync(invocation.cfgPath, JSON.stringify(cfg));
+		}
+	}
+
+	const proc = spawn("node", invocation.nodeArgs, {
 		cwd,
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true,
 	});
 	proc.unref();
-	return proc.pid;
+	return { pid: proc.pid };
 }
 
 /**
@@ -127,6 +212,7 @@ export function executeAsyncChain(
 		chain,
 		agents,
 		ctx,
+		config,
 		cwd,
 		maxOutput,
 		artifactsDir,
@@ -227,8 +313,15 @@ export function executeAsyncChain(
 		return buildSeqStep(s as SequentialStep, nextSessionFile());
 	});
 
+	// Build chain description with parallel groups shown as [agent1+agent2]
+	const chainDesc = chain
+		.map((s) =>
+			isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : (s as SequentialStep).agent,
+		)
+		.join(" -> ");
+
 	const runnerCwd = cwd ?? ctx.cwd;
-	const pid = spawnRunner(
+	const spawned = spawnRunner(
 		{
 			id,
 			steps,
@@ -243,19 +336,21 @@ export function executeAsyncChain(
 			asyncDir,
 			sessionId: ctx.currentSessionId,
 			piPackageRoot,
+			displayLabel: chainDesc,
 		},
 		id,
 		runnerCwd,
+		config,
 	);
 
-	if (pid) {
+	if (spawned.pid || spawned.cmuxHost) {
 		const firstStep = chain[0];
 		const firstAgents = isParallelStep(firstStep)
 			? firstStep.parallel.map((t) => t.agent)
 			: [(firstStep as SequentialStep).agent];
 		ctx.pi.events.emit("subagent:started", {
 			id,
-			pid,
+			pid: spawned.pid,
 			agent: firstAgents[0],
 			task: isParallelStep(firstStep)
 				? firstStep.parallel[0]?.task?.slice(0, 50)
@@ -265,18 +360,15 @@ export function executeAsyncChain(
 			),
 			cwd: runnerCwd,
 			asyncDir,
+			cmuxHost: spawned.cmuxHost,
 		});
 	}
 
-	// Build chain description with parallel groups shown as [agent1+agent2]
-	const chainDesc = chain
-		.map((s) =>
-			isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : (s as SequentialStep).agent,
-		)
-		.join(" -> ");
-
+	const chainMessage = spawned.cmuxHost
+		? `Async chain: ${chainDesc} [${id}] via cmux ${spawned.cmuxHost.mode}`
+		: `Async chain: ${chainDesc} [${id}]`;
 	return {
-		content: [{ type: "text", text: `Async chain: ${chainDesc} [${id}]` }],
+		content: [{ type: "text", text: chainMessage }],
 		details: { mode: "chain", results: [], asyncId: id, asyncDir },
 	};
 }
@@ -293,6 +385,7 @@ export function executeAsyncSingle(
 		task,
 		agentConfig,
 		ctx,
+		config,
 		cwd,
 		maxOutput,
 		artifactsDir,
@@ -324,7 +417,7 @@ export function executeAsyncSingle(
 	const runnerCwd = cwd ?? ctx.cwd;
 	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, cwd);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
-	const pid = spawnRunner(
+	const spawned = spawnRunner(
 		{
 			id,
 			steps: [
@@ -353,24 +446,30 @@ export function executeAsyncSingle(
 			asyncDir,
 			sessionId: ctx.currentSessionId,
 			piPackageRoot,
+			displayLabel: `${agent}: ${task.slice(0, 40)}`,
 		},
 		id,
 		runnerCwd,
+		config,
 	);
 
-	if (pid) {
+	if (spawned.pid || spawned.cmuxHost) {
 		ctx.pi.events.emit("subagent:started", {
 			id,
-			pid,
+			pid: spawned.pid,
 			agent,
 			task: task?.slice(0, 50),
 			cwd: runnerCwd,
 			asyncDir,
+			cmuxHost: spawned.cmuxHost,
 		});
 	}
 
+	const singleMessage = spawned.cmuxHost
+		? `Async: ${agent} [${id}] via cmux ${spawned.cmuxHost.mode}`
+		: `Async: ${agent} [${id}]`;
 	return {
-		content: [{ type: "text", text: `Async: ${agent} [${id}]` }],
+		content: [{ type: "text", text: singleMessage }],
 		details: { mode: "single", results: [], asyncId: id, asyncDir },
 	};
 }

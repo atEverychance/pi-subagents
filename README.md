@@ -6,6 +6,8 @@
 
 Pi extension for delegating tasks to subagents with chains, parallel execution, TUI clarification, and async support.
 
+> This fork adds **cmux-hosted async subagents** so background runs can live in real cmux splits/workspaces instead of only detached subprocesses.
+
 https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
 
 ## Installation
@@ -191,6 +193,13 @@ Add `--bg` at the end of any slash command to run in the background:
 ```
 
 Without `--bg`, the run is foreground: the tool call stays active and streams progress until completion. With `--bg`, the run is launched asynchronously: control returns immediately, and completion arrives later via notification. In both cases subagents run as separate processes. Check status with `subagent_status`.
+
+When running inside **cmux**, this fork can host async/background subagents in real cmux surfaces:
+- **single async run** → opens a **split** by default
+- **chain / multi-step async run** → opens a **workspace** by default
+- the hosted shell stays open after completion by default for inspection
+
+This only affects async/background runs. Foreground runs keep the existing inline streaming UI.
 
 ### Forked Context Execution
 
@@ -678,6 +687,33 @@ Session root resolution follows this precedence:
 3. Derived from parent session (stored alongside parent session file)
 
 Sessions are always enabled — every subagent run gets a session directory for tracking.
+
+### `cmuxAsyncHost`
+
+This fork can optionally host **async** subagents in real cmux panes/workspaces when pi itself is running inside cmux.
+
+```json
+{
+  "cmuxAsyncHost": "auto",
+  "cmuxSplitDirection": "right",
+  "cmuxKeepShellOpen": true
+}
+```
+
+Values:
+- `cmuxAsyncHost`: `"off" | "auto" | "split" | "workspace"`
+  - `auto` = single async run uses a split, multi-step async run uses a workspace
+- `cmuxSplitDirection`: `"left" | "right" | "up" | "down"`
+- `cmuxKeepShellOpen`: leave the hosted shell open after completion (default: `true`)
+- `cmuxBin`: override the cmux executable path if needed
+
+Environment overrides:
+- `PI_SUBAGENTS_CMUX_ASYNC=off|auto|split|workspace`
+- `PI_SUBAGENTS_CMUX_SPLIT_DIRECTION=left|right|up|down`
+- `PI_SUBAGENTS_CMUX_KEEP_SHELL_OPEN=0|1`
+- `PI_SUBAGENTS_CMUX_BIN=/path/to/cmux`
+
+When cmux hosting is enabled, async result files still work as before. The hosted pane/workspace is only the transport/visibility layer.
 
 ## Chain Directory
 Each chain run creates `<tmpdir>/pi-chain-runs/{runId}/` containing:

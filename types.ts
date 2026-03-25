@@ -238,6 +238,10 @@ export interface RunSyncOptions {
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
 	defaultSessionDir?: string;
+	cmuxAsyncHost?: "off" | "auto" | "split" | "workspace";
+	cmuxSplitDirection?: "left" | "right" | "up" | "down";
+	cmuxKeepShellOpen?: boolean;
+	cmuxBin?: string;
 }
 
 // ============================================================================

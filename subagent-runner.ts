@@ -24,6 +24,7 @@ import {
 	MAX_PARALLEL_CONCURRENCY,
 } from "./parallel-utils.js";
 import { buildPiArgs, cleanupTempDir } from "./pi-args.js";
+import type { CmuxHost } from "./cmux-async.js";
 
 interface SubagentRunConfig {
 	id: string;
@@ -41,6 +42,8 @@ interface SubagentRunConfig {
 	asyncDir: string;
 	sessionId?: string | null;
 	piPackageRoot?: string;
+	cmuxHost?: CmuxHost;
+	streamToStdout?: boolean;
 }
 
 interface StepResult {
@@ -107,6 +110,7 @@ function runPiStreaming(
 	outputFile: string,
 	env?: Record<string, string | undefined>,
 	piPackageRoot?: string,
+	streamToStdout = false,
 ): Promise<{ stdout: string; exitCode: number | null }> {
 	return new Promise((resolve) => {
 		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
@@ -119,10 +123,13 @@ function runPiStreaming(
 			const text = chunk.toString();
 			stdout += text;
 			outputStream.write(text);
+			if (streamToStdout) process.stdout.write(text);
 		});
 
 		child.stderr.on("data", (chunk: Buffer) => {
-			outputStream.write(chunk.toString());
+			const text = chunk.toString();
+			outputStream.write(text);
+			if (streamToStdout) process.stderr.write(text);
 		});
 
 		child.on("close", (exitCode) => {
@@ -274,6 +281,7 @@ interface SingleStepContext {
 	flatStepCount: number;
 	outputFile: string;
 	piPackageRoot?: string;
+	streamToStdout?: boolean;
 }
 
 /** Run a single pi agent step, returning output and metadata */
@@ -310,7 +318,14 @@ async function runSingleStep(
 		}
 	}
 
-	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, env, ctx.piPackageRoot);
+	const result = await runPiStreaming(
+		args,
+		step.cwd ?? ctx.cwd,
+		ctx.outputFile,
+		env,
+		ctx.piPackageRoot,
+		ctx.streamToStdout ?? false,
+	);
 	cleanupTempDir(tempDir);
 
 	const output = (result.stdout || "").trim();
@@ -400,6 +415,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		gistUrl?: string;
 		shareError?: string;
 		error?: string;
+		cmuxHost?: CmuxHost;
 	} = {
 		runId: id,
 		mode: flatSteps.length > 1 ? "chain" : "single",
@@ -413,6 +429,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		artifactsDir,
 		sessionDir: config.sessionDir,
 		outputFile: path.join(asyncDir, "output-0.log"),
+		cmuxHost: config.cmuxHost,
 	};
 
 	fs.mkdirSync(asyncDir, { recursive: true });
@@ -428,6 +445,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			pid: process.pid,
 		}),
 	);
+	if (config.streamToStdout) {
+		process.stdout.write(`\n=== pi-subagents ${statusPayload.mode} ${id} ===\n`);
+		process.stdout.write(`cwd: ${cwd}\n\n`);
+	}
 
 	// Track the flat index into statusPayload.steps across sequential + parallel steps
 	let flatIndex = 0;
@@ -463,6 +484,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				agents: group.parallel.map((t) => t.agent),
 				count: group.parallel.length,
 			}));
+			if (config.streamToStdout) {
+				process.stdout.write(`\n=== Parallel group ${stepIndex + 1}: ${group.parallel.map((t) => t.agent).join(", ")} ===\n`);
+			}
 
 			const parallelResults = await mapConcurrent(
 				group.parallel,
@@ -478,6 +502,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					appendJsonl(eventsPath, JSON.stringify({
 						type: "subagent.step.started", ts: taskStartTime, runId: id, stepIndex: fi, agent: task.agent,
 					}));
+					if (config.streamToStdout) {
+						process.stdout.write(`\n--- Task ${fi + 1}/${flatSteps.length}: ${task.agent} ---\n`);
+					}
 
 					// Each parallel task gets its own session subdirectory to avoid conflicts
 					const taskSessionDir = config.sessionDir
@@ -491,6 +518,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						flatIndex: fi, flatStepCount: flatSteps.length,
 						outputFile: path.join(asyncDir, `output-${fi}.log`),
 						piPackageRoot: config.piPackageRoot,
+						streamToStdout: config.streamToStdout,
 					});
 					if (task.sessionFile) {
 						latestSessionFile = task.sessionFile;
@@ -586,6 +614,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				stepIndex: flatIndex,
 				agent: seqStep.agent,
 			}));
+			if (config.streamToStdout) {
+				process.stdout.write(`\n=== Step ${flatIndex + 1}/${flatSteps.length}: ${seqStep.agent} ===\n`);
+			}
 
 			const singleResult = await runSingleStep(seqStep, {
 				previousOutput, placeholder, cwd, sessionEnabled,
@@ -594,6 +625,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				flatIndex, flatStepCount: flatSteps.length,
 				outputFile: path.join(asyncDir, `output-${flatIndex}.log`),
 				piPackageRoot: config.piPackageRoot,
+				streamToStdout: config.streamToStdout,
 			});
 			if (seqStep.sessionFile) {
 				latestSessionFile = seqStep.sessionFile;
@@ -769,6 +801,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				shareUrl,
 				gistUrl,
 				shareError,
+				cmuxHost: config.cmuxHost,
 				...(taskIndex !== undefined && { taskIndex }),
 				...(totalTasks !== undefined && { totalTasks }),
 			}),
