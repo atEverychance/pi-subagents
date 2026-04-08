@@ -193,16 +193,99 @@ function withForkContext(
 	};
 }
 
-function toExecutionErrorResult(params: SubagentParamsLike, error: unknown): AgentToolResult<Details> {
+function buildExecutionErrorResult(params: SubagentParamsLike, error: unknown): AgentToolResult<Details> {
 	const message = error instanceof Error ? error.message : String(error);
-	return withForkContext(
-		{
-			content: [{ type: "text", text: message }],
-			isError: true,
-			details: { mode: getRequestedModeLabel(params), results: [] },
-		},
-		params.context,
-	);
+	return {
+		content: [{ type: "text", text: message }],
+		isError: true,
+		details: { mode: getRequestedModeLabel(params), results: [] },
+	};
+}
+
+function toExecutionErrorResult(params: SubagentParamsLike, error: unknown): AgentToolResult<Details> {
+	return withForkContext(buildExecutionErrorResult(params, error), params.context);
+}
+
+function clipCompletionText(text: string, maxChars: number = 1500): string {
+	const normalized = text.trim();
+	if (!normalized) return "(no output)";
+	if (normalized.length <= maxChars) return normalized;
+	return `${normalized.slice(0, maxChars - 1)}…`;
+}
+
+function extractCompletionSummary(result: AgentToolResult<Details>): string {
+	for (const item of result.content) {
+		if (item.type === "text" && item.text.trim()) return item.text.trim();
+	}
+	return "(no output)";
+}
+
+function resolveCompletionAgent(
+	params: SubagentParamsLike,
+	details: Details,
+): string | null {
+	if (details.mode === "single") {
+		return details.results[0]?.agent ?? params.agent ?? null;
+	}
+	if (details.mode === "chain") {
+		return details.chainAgents?.join(" → ") ?? "chain";
+	}
+	if (details.mode === "parallel") {
+		return "parallel";
+	}
+	return params.agent ?? null;
+}
+
+function persistSyncCompletion(
+	deps: ExecutorDeps,
+	data: ExecutionContextData,
+	ctx: ExtensionContext,
+	params: SubagentParamsLike,
+	result: AgentToolResult<Details>,
+): void {
+	const details = result.details;
+	if (!details || details.mode === "management" || details.asyncId || details.asyncDir) return;
+
+	const summary = clipCompletionText(extractCompletionSummary(result));
+	const cancelled = !result.isError && details.results.length === 0 && summary === "Cancelled";
+	const shouldEmit = cancelled || result.isError || details.results.length > 0;
+	if (!shouldEmit) return;
+
+	const success = !cancelled
+		&& !result.isError
+		&& details.results.length > 0
+		&& details.results.every((entry) => entry.exitCode === 0);
+	const timestamp = Date.now();
+	const receiptPath = path.join(data.sessionRoot, "completion-receipt.json");
+
+	const payload = {
+		id: null,
+		agent: resolveCompletionAgent(params, details),
+		success,
+		...(cancelled ? { cancelled: true } : {}),
+		executionMode: "sync" as const,
+		summary,
+		exitCode: cancelled ? 130 : (success ? 0 : 1),
+		timestamp,
+		sessionId: deps.state.currentSessionId ?? undefined,
+		cwd: ctx.cwd,
+		sessionFile: details.results[0]?.sessionFile,
+		receiptPath,
+		results: details.results.map((entry) => ({
+			agent: entry.agent,
+			success: entry.exitCode === 0,
+			output: clipCompletionText(getFinalOutput(entry.messages) || entry.error || "(no output)", 500),
+		})),
+	};
+
+	try {
+		fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
+		fs.writeFileSync(receiptPath, JSON.stringify(payload, null, 2), "utf-8");
+	} catch {
+		// Best effort: completion events should still be emitted even if receipt persistence fails.
+	}
+
+	deps.pi.events.emit("subagent:complete", payload);
 }
 
 function collectChainSessionFiles(
@@ -889,23 +972,30 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			effectiveAsync,
 		};
 
+		const finalizeExecutionResult = (result: AgentToolResult<Details>): AgentToolResult<Details> => {
+			if (!effectiveAsync) {
+				persistSyncCompletion(deps, execData, ctx, params, result);
+			}
+			return withForkContext(result, params.context);
+		};
+
 		try {
 			const asyncResult = runAsyncPath(execData, deps);
 			if (asyncResult) return withForkContext(asyncResult, params.context);
 
 			if (hasChain && params.chain) {
-				return withForkContext(await runChainPath(execData, deps), params.context);
+				return finalizeExecutionResult(await runChainPath(execData, deps));
 			}
 
 			if (hasTasks && params.tasks) {
-				return withForkContext(await runParallelPath(execData, deps), params.context);
+				return finalizeExecutionResult(await runParallelPath(execData, deps));
 			}
 
 			if (hasSingle) {
-				return withForkContext(await runSinglePath(execData, deps), params.context);
+				return finalizeExecutionResult(await runSinglePath(execData, deps));
 			}
 		} catch (error) {
-			return toExecutionErrorResult(params, error);
+			return finalizeExecutionResult(buildExecutionErrorResult(params, error));
 		}
 
 		return withForkContext({

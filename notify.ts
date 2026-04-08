@@ -15,10 +15,13 @@ interface SubagentResult {
 	id: string | null;
 	agent: string | null;
 	success: boolean;
+	cancelled?: boolean;
+	executionMode?: "sync" | "async";
 	summary: string;
 	exitCode: number;
 	timestamp: number;
 	sessionFile?: string;
+	receiptPath?: string;
 	shareUrl?: string;
 	gistUrl?: string;
 	shareError?: string;
@@ -38,7 +41,8 @@ export default function registerSubagentNotify(pi: ExtensionAPI): void {
 		if (markSeenWithTtl(seen, key, now, ttlMs)) return;
 
 		const agent = result.agent ?? "unknown";
-		const status = result.success ? "completed" : "failed";
+		const status = result.cancelled ? "cancelled" : result.success ? "completed" : "failed";
+		const subject = result.executionMode === "sync" ? "Delegation" : "Background task";
 
 		const taskInfo =
 			result.taskIndex !== undefined && result.totalTasks !== undefined
@@ -53,9 +57,12 @@ export default function registerSubagentNotify(pi: ExtensionAPI): void {
 		} else if (result.sessionFile) {
 			extra.push(`Session file: ${result.sessionFile}`);
 		}
+		if (result.receiptPath) {
+			extra.push(`Receipt: ${result.receiptPath}`);
+		}
 
 		const content = [
-			`Background task ${status}: **${agent}**${taskInfo}`,
+			`${subject} ${status}: **${agent}**${taskInfo}`,
 			"",
 			result.summary,
 			extra.length ? "" : undefined,
