@@ -18,6 +18,12 @@ export function createResultWatcher(
 	const handleResult = (file: string) => {
 		const resultPath = path.join(resultsDir, file);
 		if (!fs.existsSync(resultPath)) return;
+		if (file.startsWith("sync-")) {
+			try {
+				fs.unlinkSync(resultPath);
+			} catch {}
+			return;
+		}
 		try {
 			const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as {
 				sessionId?: string;

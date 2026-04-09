@@ -199,7 +199,7 @@ export function renderSubagentResult(
 				? theme.fg("success", "ok")
 				: theme.fg("error", "X");
 		const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";
-		const output = r.truncation?.text || getFinalOutput(r.messages);
+		const output = d.compactDisplay || r.truncation?.text || getFinalOutput(r.messages);
 
 		const progressInfo = isRunning && r.progress
 			? ` | ${r.progress.toolCount} tools, ${formatTokens(r.progress.tokens)} tok, ${formatDuration(r.progress.durationMs)}`

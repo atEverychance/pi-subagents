@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildHostedCommand, clipTitle, getCmuxAsyncConfig } from "./cmux-async.ts";
+import { buildHostedCommand, clipTitle, closeCmuxHost, getCmuxAsyncConfig } from "./cmux-async.ts";
 
 describe("clipTitle", () => {
 	it("truncates long titles safely", () => {
@@ -34,5 +34,41 @@ describe("buildHostedCommand", () => {
 		assert.match(command, /bash -lc/);
 		assert.match(command, /tab-action --action rename/);
 		assert.match(command, /exec \$SHELL -l/);
+	});
+});
+
+describe("closeCmuxHost", () => {
+	it("treats missing split surface as already closed", () => {
+		const result = closeCmuxHost(
+			{ mode: "split", title: "run", surfaceRef: "surface:42" },
+			"cmux",
+			() => ({ ok: false, stdout: "", stderr: "surface not found" }),
+		);
+		assert.equal(result.state, "already_closed");
+	});
+
+	it("marks split host closed when close command succeeds", () => {
+		const result = closeCmuxHost(
+			{ mode: "split", title: "run", surfaceRef: "surface:42" },
+			"cmux",
+			() => ({ ok: true, stdout: "", stderr: "" }),
+		);
+		assert.equal(result.state, "closed");
+	});
+
+	it("treats missing workspace as already closed even when close command is unsupported", () => {
+		let calls = 0;
+		const result = closeCmuxHost(
+			{ mode: "workspace", title: "run", workspaceId: "123" },
+			"cmux",
+			(_bin, args) => {
+				calls++;
+				if (args[0] === "workspace-action") return { ok: false, stdout: "", stderr: "unknown command workspace-action" };
+				if (args[0] === "close-workspace") return { ok: false, stdout: "", stderr: "unknown command close-workspace" };
+				return { ok: false, stdout: "", stderr: "workspace does not exist" };
+			},
+		);
+		assert.equal(result.state, "already_closed");
+		assert.equal(calls >= 3, true);
 	});
 });

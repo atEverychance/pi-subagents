@@ -36,6 +36,12 @@ export default function registerSubagentNotify(pi: ExtensionAPI): void {
 
 	const handleComplete = (data: unknown) => {
 		const result = data as SubagentResult;
+		if (result.executionMode === "sync") {
+			// Foreground/sync runs already surface completion through the active tool result.
+			// Triggering a second turn here can abort the parent handoff before it sends
+			// its final summary back to the user.
+			return;
+		}
 		const now = Date.now();
 		const key = buildCompletionKey(result, "notify");
 		if (markSeenWithTtl(seen, key, now, ttlMs)) return;

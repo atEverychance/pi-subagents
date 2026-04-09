@@ -23,6 +23,7 @@ import { discoverAvailableSkills, normalizeSkillInput } from "./skills.js";
 import { executeAsyncChain, executeAsyncSingle, isAsyncAvailable } from "./async-execution.js";
 import { createForkContextResolver } from "./fork-context.js";
 import { finalizeSingleOutput, injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.js";
+import { buildCompactSyncCloseout } from "./sync-closeout.js";
 import { getFinalOutput, mapConcurrent } from "./utils.js";
 import {
 	type AgentProgress,
@@ -36,7 +37,6 @@ import {
 	DEFAULT_ARTIFACT_CONFIG,
 	MAX_CONCURRENCY,
 	MAX_PARALLEL,
-	RESULTS_DIR,
 	checkSubagentDepth,
 	wrapForkTask,
 } from "./types.js";
@@ -243,14 +243,14 @@ function persistSyncCompletion(
 	ctx: ExtensionContext,
 	params: SubagentParamsLike,
 	result: AgentToolResult<Details>,
-): void {
+): { receiptPath: string } | null {
 	const details = result.details;
-	if (!details || details.mode === "management" || details.asyncId || details.asyncDir) return;
+	if (!details || details.mode === "management" || details.asyncId || details.asyncDir) return null;
 
 	const summary = clipCompletionText(extractCompletionSummary(result));
 	const cancelled = !result.isError && details.results.length === 0 && summary === "Cancelled";
 	const shouldEmit = cancelled || result.isError || details.results.length > 0;
-	if (!shouldEmit) return;
+	if (!shouldEmit) return null;
 
 	const success = !cancelled
 		&& !result.isError
@@ -259,7 +259,6 @@ function persistSyncCompletion(
 	const timestamp = Date.now();
 	const receiptId = `sync-${data.runId}`;
 	const receiptPath = path.join(data.sessionRoot, "completion-receipt.json");
-	const resultPath = path.join(RESULTS_DIR, `${receiptId}.json`);
 
 	const payload = {
 		id: receiptId,
@@ -285,17 +284,38 @@ function persistSyncCompletion(
 		fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
 		fs.writeFileSync(receiptPath, JSON.stringify(payload, null, 2), "utf-8");
 	} catch {
-		// Best effort: completion events should still be emitted even if receipt persistence fails.
+		// Best effort: foreground completions still return through the active tool result.
 	}
+	return { receiptPath };
+}
 
-	try {
-		fs.mkdirSync(RESULTS_DIR, { recursive: true });
-		fs.writeFileSync(resultPath, JSON.stringify(payload, null, 2), "utf-8");
-	} catch {
-		// Best effort: the direct event below still provides immediate completion signaling.
+function applyCompactSyncCloseout(
+	result: AgentToolResult<Details>,
+	receiptPath: string | undefined,
+): AgentToolResult<Details> {
+	const details = result.details;
+	if (!details || details.mode !== "single" || details.results.length !== 1 || details.asyncId || details.asyncDir) {
+		return result;
 	}
-
-	deps.pi.events.emit("subagent:complete", payload);
+	const single = details.results[0];
+	if (!single) return result;
+	const compactDisplay = buildCompactSyncCloseout({
+		agent: single.agent,
+		success: single.exitCode === 0,
+		cancelled: !result.isError && single.exitCode === 130,
+		outputText: getFinalOutput(single.messages),
+		errorText: single.error,
+		sessionFile: single.sessionFile,
+		receiptPath,
+	});
+	return {
+		...result,
+		content: [{ type: "text", text: compactDisplay }],
+		details: {
+			...details,
+			compactDisplay,
+		},
+	};
 }
 
 function collectChainSessionFiles(
@@ -983,10 +1003,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		};
 
 		const finalizeExecutionResult = (result: AgentToolResult<Details>): AgentToolResult<Details> => {
+			let finalized = result;
 			if (!effectiveAsync) {
-				persistSyncCompletion(deps, execData, ctx, params, result);
+				const persisted = persistSyncCompletion(deps, execData, ctx, params, finalized);
+				finalized = applyCompactSyncCloseout(finalized, persisted?.receiptPath);
 			}
-			return withForkContext(result, params.context);
+			return withForkContext(finalized, params.context);
 		};
 
 		try {

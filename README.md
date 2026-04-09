@@ -192,7 +192,9 @@ Add `--bg` at the end of any slash command to run in the background:
 /parallel scout "scan frontend" -> scout "scan backend" -> scout "scan infra" --bg
 ```
 
-Without `--bg`, the run is foreground: the tool call stays active and streams progress until completion. With `--bg`, the run is launched asynchronously: control returns immediately, and completion arrives later via notification. In both cases subagents run as separate processes. Check status with `subagent_status`.
+Without `--bg`, the run is foreground: the tool call stays active and streams progress until completion, and the parent receives the result back through that active tool call only. Foreground completions now return a compact closeout with receipt/session paths instead of replaying the full child prose inline. With `--bg`, the run is launched asynchronously: control returns immediately, and completion arrives later via notification. In both cases subagents run as separate processes. Check status with `subagent_status`.
+
+> After changing extension code, run `/reload` (or restart pi) before treating the next handoff test as meaningful. Repo edits on disk do not hot-swap already-loaded extension handlers.
 
 When running inside **cmux**, this fork can host async/background subagents in real cmux surfaces:
 - **single async run** → opens a **split** by default
@@ -822,7 +824,7 @@ Async events:
 - `subagent:started`
 - `subagent:complete`
 
-`notify.ts` consumes `subagent:complete` as the canonical completion channel.
+`notify.ts` consumes `subagent:complete` as the canonical completion channel for async/background runs only. Foreground/sync completions do not trigger a second notification turn; they complete through the active tool result, return a compact closeout, and persist a session-local `completion-receipt.json` for the full handoff record.
 
 ## Files
 

@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AsyncStatus, DisplayItem, ErrorInfo } from "./types.js";
+import { closeCmuxHost } from "./cmux-async.js";
 
 // ============================================================================
 // File System Utilities
@@ -15,26 +16,89 @@ import type { AsyncStatus, DisplayItem, ErrorInfo } from "./types.js";
 // Cache for status file reads - avoid re-reading unchanged files
 const statusCache = new Map<string, { mtime: number; status: AsyncStatus }>();
 
+function isTerminalAsyncState(state: AsyncStatus["state"]): boolean {
+	return state === "complete" || state === "failed";
+}
+
+function isPidAlive(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException)?.code;
+		if (code === "EPERM") return true;
+		return false;
+	}
+}
+
+function reconcileStatus(statusPath: string, status: AsyncStatus): { changed: boolean; status: AsyncStatus } {
+	let changed = false;
+	const now = Date.now();
+
+	if ((status.state === "queued" || status.state === "running") && typeof status.pid === "number" && !isPidAlive(status.pid)) {
+		status.state = "failed";
+		status.orphaned = true;
+		status.error = status.error || `Runner process ${status.pid} is no longer active.`;
+		status.endedAt = status.endedAt ?? now;
+		status.lastUpdate = now;
+		changed = true;
+	}
+
+	if (
+		isTerminalAsyncState(status.state)
+		&& status.cmuxHost
+		&& (!status.cmuxHost.cleanupState || status.cmuxHost.cleanupState === "pending")
+	) {
+		const cmuxBin = (process.env.PI_SUBAGENTS_CMUX_BIN || "cmux").trim() || "cmux";
+		const cleanup = closeCmuxHost(status.cmuxHost, cmuxBin);
+		status.cmuxHost.cleanupState = cleanup.state;
+		status.cmuxHost.cleanupAt = now;
+		if (cleanup.state === "error") {
+			status.cmuxHost.cleanupError = cleanup.message;
+		} else {
+			delete status.cmuxHost.cleanupError;
+		}
+		status.lastUpdate = now;
+		changed = true;
+	}
+
+	if (changed) {
+		fs.writeFileSync(statusPath, JSON.stringify(status, null, 2));
+	}
+
+	return { changed, status };
+}
+
 /**
  * Read async job status from disk (with mtime-based caching)
  */
 export function readStatus(asyncDir: string): AsyncStatus | null {
 	const statusPath = path.join(asyncDir, "status.json");
 	try {
-		const stat = fs.statSync(statusPath);
+		let stat = fs.statSync(statusPath);
 		const cached = statusCache.get(statusPath);
 		if (cached && cached.mtime === stat.mtimeMs) {
-			return cached.status;
+			const reconciledCached = reconcileStatus(statusPath, cached.status);
+			if (reconciledCached.changed) {
+				stat = fs.statSync(statusPath);
+			}
+			statusCache.set(statusPath, { mtime: stat.mtimeMs, status: reconciledCached.status });
+			return reconciledCached.status;
 		}
 		const content = fs.readFileSync(statusPath, "utf-8");
 		const status = JSON.parse(content) as AsyncStatus;
-		statusCache.set(statusPath, { mtime: stat.mtimeMs, status });
+		const reconciled = reconcileStatus(statusPath, status);
+		if (reconciled.changed) {
+			stat = fs.statSync(statusPath);
+		}
+		statusCache.set(statusPath, { mtime: stat.mtimeMs, status: reconciled.status });
 		// Limit cache size to prevent memory leaks
 		if (statusCache.size > 50) {
 			const firstKey = statusCache.keys().next().value;
 			if (firstKey) statusCache.delete(firstKey);
 		}
-		return status;
+		return reconciled.status;
 	} catch {
 		return null;
 	}

@@ -13,6 +13,20 @@ export function createAsyncJobTracker(state: SubagentState, asyncDirRoot: string
 	handleComplete: (data: unknown) => void;
 	resetJobs: (ctx?: ExtensionContext) => void;
 } {
+	const isTerminal = (status: string): boolean => status === "complete" || status === "failed";
+
+	const scheduleCleanup = (asyncId: string, delayMs = 10000) => {
+		if (state.cleanupTimers.has(asyncId)) return;
+		const timer = setTimeout(() => {
+			state.cleanupTimers.delete(asyncId);
+			state.asyncJobs.delete(asyncId);
+			if (state.lastUiContext) {
+				renderWidget(state.lastUiContext, Array.from(state.asyncJobs.values()));
+			}
+		}, delayMs);
+		state.cleanupTimers.set(asyncId, timer);
+	};
+
 	const ensurePoller = () => {
 		if (state.poller) return;
 		state.poller = setInterval(() => {
@@ -26,8 +40,9 @@ export function createAsyncJobTracker(state: SubagentState, asyncDirRoot: string
 				return;
 			}
 
-			for (const job of state.asyncJobs.values()) {
-				if (job.status === "complete" || job.status === "failed") {
+			for (const [asyncId, job] of state.asyncJobs.entries()) {
+				if (isTerminal(job.status)) {
+					scheduleCleanup(asyncId);
 					continue;
 				}
 				const status = readStatus(job.asyncDir);
@@ -45,6 +60,9 @@ export function createAsyncJobTracker(state: SubagentState, asyncDirRoot: string
 					job.outputFile = status.outputFile ?? job.outputFile;
 					job.totalTokens = status.totalTokens ?? job.totalTokens;
 					job.sessionFile = status.sessionFile ?? job.sessionFile;
+					if (isTerminal(job.status)) {
+						scheduleCleanup(asyncId);
+					}
 				} else {
 					job.status = job.status === "queued" ? "running" : job.status;
 					job.updatedAt = Date.now();
@@ -96,14 +114,7 @@ export function createAsyncJobTracker(state: SubagentState, asyncDirRoot: string
 		if (state.lastUiContext) {
 			renderWidget(state.lastUiContext, Array.from(state.asyncJobs.values()));
 		}
-		const timer = setTimeout(() => {
-			state.cleanupTimers.delete(asyncId);
-			state.asyncJobs.delete(asyncId);
-			if (state.lastUiContext) {
-				renderWidget(state.lastUiContext, Array.from(state.asyncJobs.values()));
-			}
-		}, 10000);
-		state.cleanupTimers.set(asyncId, timer);
+		scheduleCleanup(asyncId);
 	};
 
 	const resetJobs = (ctx?: ExtensionContext) => {

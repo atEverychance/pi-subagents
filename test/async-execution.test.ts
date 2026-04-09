@@ -21,6 +21,19 @@ const available = !!(asyncMod && utils);
 const isAsyncAvailable = asyncMod?.isAsyncAvailable;
 const readStatus = utils?.readStatus;
 
+function findDeadPid(): number {
+	for (let candidate = 900_000; candidate < 901_000; candidate++) {
+		try {
+			process.kill(candidate, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code === "ESRCH") {
+				return candidate;
+			}
+		}
+	}
+	return 9_999_999;
+}
+
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	it("reports jiti availability as boolean", () => {
 		const result = isAsyncAvailable();
@@ -71,6 +84,35 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.ok(s1);
 			assert.ok(s2);
 			assert.equal(s1.runId, s2.runId);
+		} finally {
+			removeTempDir(dir);
+		}
+	});
+
+	it("readStatus reconciles stale running state when pid is gone", () => {
+		const dir = createTempDir();
+		try {
+			const deadPid = findDeadPid();
+			const statusData = {
+				runId: "orphaned-run",
+				state: "running",
+				mode: "single",
+				startedAt: Date.now() - 5_000,
+				lastUpdate: Date.now() - 5_000,
+				pid: deadPid,
+			};
+			fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(statusData));
+
+			const status = readStatus(dir);
+			assert.ok(status);
+			assert.equal(status.state, "failed");
+			assert.equal(status.orphaned, true);
+			assert.match(status.error || "", new RegExp(String(deadPid)));
+			assert.ok(status.endedAt, "expected endedAt to be set");
+
+			const persisted = JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf-8"));
+			assert.equal(persisted.state, "failed");
+			assert.equal(persisted.orphaned, true);
 		} finally {
 			removeTempDir(dir);
 		}

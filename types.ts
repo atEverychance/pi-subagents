@@ -7,6 +7,7 @@ import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { FSWatcher } from "node:fs";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { CmuxHost } from "./cmux-async.js";
 
 // ============================================================================
 // Basic Types
@@ -105,6 +106,7 @@ export interface Details {
 	results: SingleResult[];
 	asyncId?: string;
 	asyncDir?: string;
+	compactDisplay?: string;
 	progress?: AgentProgress[];
 	progressSummary?: ProgressSummary;
 	artifacts?: {
@@ -154,12 +156,17 @@ export interface AsyncStatus {
 	startedAt: number;
 	endedAt?: number;
 	lastUpdate?: number;
+	pid?: number;
+	cwd?: string;
 	currentStep?: number;
 	steps?: Array<{ agent: string; status: string; durationMs?: number; tokens?: TokenUsage; skills?: string[] }>;
 	sessionDir?: string;
 	outputFile?: string;
 	totalTokens?: TokenUsage;
 	sessionFile?: string;
+	error?: string;
+	orphaned?: boolean;
+	cmuxHost?: CmuxHost;
 }
 
 export interface AsyncJobState {

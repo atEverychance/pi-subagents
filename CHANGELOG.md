@@ -187,6 +187,9 @@
 - Agent `extensions` frontmatter support for extension sandboxing: absent field keeps default extension discovery, empty value disables all extensions, and comma-separated values create an explicit extension allowlist.
 
 ### Fixed
+- Foreground/sync subagent completions now use a single return path: the active tool result plus the session-local `completion-receipt.json`. Sync runs no longer emit notification turns or write `RESULTS_DIR/sync-*.json` files that can race the parent handoff.
+- Foreground/sync closeout is now intentionally compact: the tool result returns a short status + preview + session/receipt paths instead of replaying the full child prose inline, reducing parent post-processing after successful handoff.
+- Result watcher now ignores and cleans up stale `sync-*.json` files so pre-change foreground receipts cannot retrigger `subagent:complete` on reload.
 - Parallel chain aggregation now surfaces step failures and warnings in `{previous}` instead of silently passing empty output.
 - Empty-output warnings are now context-aware: runs that intentionally write to explicit output paths are not flagged as warning-only successes in the renderer.
 - Async execution now respects agent `extensions` sandbox settings, matching sync behavior.

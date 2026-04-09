@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 export type CmuxAsyncHostMode = "off" | "auto" | "split" | "workspace";
 export type CmuxSplitDirection = "left" | "right" | "up" | "down";
 export type CmuxPlacement = "split" | "workspace";
+export type CmuxHostCleanupState = "pending" | "closed" | "already_closed" | "error";
 
 export interface CmuxHost {
 	mode: CmuxPlacement;
@@ -12,6 +13,9 @@ export interface CmuxHost {
 	surfaceRef?: string;
 	originWorkspaceId?: string;
 	originSurfaceId?: string;
+	cleanupState?: CmuxHostCleanupState;
+	cleanupAt?: number;
+	cleanupError?: string;
 }
 
 export interface CmuxAsyncConfig {
@@ -80,13 +84,28 @@ function parseJson<T>(text: string): T | null {
 	}
 }
 
-function execCmux(bin: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
+type CmuxExecResult = { ok: boolean; stdout: string; stderr: string };
+type CmuxExec = (bin: string, args: string[]) => CmuxExecResult;
+
+function execCmux(bin: string, args: string[]): CmuxExecResult {
 	const result = spawnSync(bin, args, { encoding: "utf-8" });
 	return {
 		ok: result.status === 0,
 		stdout: result.stdout || "",
 		stderr: result.stderr || "",
 	};
+}
+
+function cmuxMessage(result: CmuxExecResult): string {
+	return `${result.stderr || ""}\n${result.stdout || ""}`.trim();
+}
+
+function isMissingCmuxTarget(text: string): boolean {
+	return /not found|no such|does not exist|unknown\s+(?:surface|workspace)|invalid\s+(?:surface|workspace)/i.test(text);
+}
+
+function isUnsupportedCmuxCommand(text: string): boolean {
+	return /unknown command|unknown option|invalid option|usage:/i.test(text);
 }
 
 function isInsideCmux(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -188,6 +207,7 @@ export function launchRunnerInCmux(options: CmuxLaunchOptions): CmuxHost | null 
 			workspaceRef: parseWorkspaceRef(renamed.stdout),
 			originWorkspaceId,
 			originSurfaceId,
+			cleanupState: "pending",
 		};
 	}
 
@@ -203,6 +223,7 @@ export function launchRunnerInCmux(options: CmuxLaunchOptions): CmuxHost | null 
 		surfaceRef: parsed.surface_ref,
 		originWorkspaceId,
 		originSurfaceId,
+		cleanupState: "pending",
 	};
 }
 
@@ -214,4 +235,49 @@ export function sendCommandToCmuxHost(host: CmuxHost, command: string, bin: stri
 		return execCmux(bin, ["send", "--surface", host.surfaceRef, command + "\n"]).ok;
 	}
 	return false;
+}
+
+export function closeCmuxHost(
+	host: CmuxHost,
+	bin: string,
+	exec: CmuxExec = execCmux,
+): { state: Exclude<CmuxHostCleanupState, "pending">; message?: string } {
+	if (host.mode === "split") {
+		if (!host.surfaceRef) return { state: "already_closed", message: "Missing surface reference" };
+		const closeResult = exec(bin, ["tab-action", "--action", "close", "--surface", host.surfaceRef]);
+		if (closeResult.ok) return { state: "closed" };
+		const closeMessage = cmuxMessage(closeResult);
+		if (isMissingCmuxTarget(closeMessage)) return { state: "already_closed", message: closeMessage };
+		const probe = exec(bin, ["tab-action", "--action", "rename", "--surface", host.surfaceRef, "--title", host.title]);
+		const probeMessage = cmuxMessage(probe);
+		if (!probe.ok && isMissingCmuxTarget(probeMessage)) {
+			return { state: "already_closed", message: probeMessage };
+		}
+		return { state: "error", message: closeMessage || probeMessage || "Failed to close cmux surface" };
+	}
+
+	if (!host.workspaceId) return { state: "already_closed", message: "Missing workspace reference" };
+	const workspaceCloseCommands: string[][] = [
+		["workspace-action", "--action", "close", "--workspace", host.workspaceId],
+		["close-workspace", "--workspace", host.workspaceId],
+	];
+	let lastMessage = "";
+	for (const args of workspaceCloseCommands) {
+		const result = exec(bin, args);
+		if (result.ok) return { state: "closed" };
+		const message = cmuxMessage(result);
+		if (isMissingCmuxTarget(message)) return { state: "already_closed", message };
+		if (!isUnsupportedCmuxCommand(message)) {
+			lastMessage = message || lastMessage;
+			break;
+		}
+		lastMessage = message || lastMessage;
+	}
+
+	const probe = exec(bin, ["rename-workspace", "--workspace", host.workspaceId, host.title]);
+	const probeMessage = cmuxMessage(probe);
+	if (!probe.ok && isMissingCmuxTarget(probeMessage)) {
+		return { state: "already_closed", message: probeMessage };
+	}
+	return { state: "error", message: lastMessage || probeMessage || "Failed to close cmux workspace" };
 }
