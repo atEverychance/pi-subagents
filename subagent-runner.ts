@@ -207,6 +207,84 @@ function writeJson(filePath: string, payload: object): void {
 	fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf-8");
 }
 
+function formatRunnerError(error: unknown): string {
+	if (error instanceof Error) return error.message || error.name;
+	if (typeof error === "string") return error;
+	return String(error);
+}
+
+function writeFatalResult(config: SubagentRunConfig, error: unknown, startedAt: number): void {
+	if (!config.resultPath) return;
+	try {
+		writeJson(config.resultPath, {
+			id: config.id,
+			agent: "runner",
+			success: false,
+			summary: `Subagent runner failed before completion: ${formatRunnerError(error)}`,
+			results: [],
+			error: formatRunnerError(error),
+			exitCode: 1,
+			timestamp: Date.now(),
+			durationMs: Date.now() - startedAt,
+			truncated: false,
+			artifactsDir: config.artifactsDir,
+			cwd: config.cwd,
+			asyncDir: config.asyncDir,
+			sessionId: config.sessionId,
+			cmuxHost: config.cmuxHost,
+			...(config.taskIndex !== undefined && { taskIndex: config.taskIndex }),
+			...(config.totalTasks !== undefined && { totalTasks: config.totalTasks }),
+		});
+	} catch (writeErr) {
+		console.error(`Failed to write result file ${config.resultPath}:`, writeErr);
+	}
+}
+
+function extractJsonStringField(raw: string, field: string): string | undefined {
+	const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const pattern = new RegExp(`"${escapedField}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
+	const match = raw.match(pattern);
+	if (!match?.[1]) return undefined;
+	try {
+		return JSON.parse(`"${match[1]}"`) as string;
+	} catch {
+		return match[1];
+	}
+}
+
+function writeFatalResultFromConfigText(raw: string, error: unknown, startedAt: number): void {
+	const resultPath = extractJsonStringField(raw, "resultPath");
+	if (!resultPath) return;
+
+	try {
+		writeJson(resultPath, {
+			id: extractJsonStringField(raw, "id") || "runner-config-load-failure",
+			agent: "runner",
+			success: false,
+			summary: `Subagent runner failed before completion: ${formatRunnerError(error)}`,
+			results: [],
+			error: formatRunnerError(error),
+			exitCode: 1,
+			timestamp: Date.now(),
+			durationMs: Date.now() - startedAt,
+			truncated: false,
+			cwd: extractJsonStringField(raw, "cwd") || process.cwd(),
+			asyncDir: extractJsonStringField(raw, "asyncDir") || undefined,
+		});
+	} catch (writeErr) {
+		console.error(`Failed to write result file ${resultPath}:`, writeErr);
+	}
+}
+
+function writeFatalResultFromConfigArg(configArg: string, error: unknown, startedAt: number): void {
+	try {
+		writeFatalResultFromConfigText(fs.readFileSync(configArg, "utf-8"), error, startedAt);
+	} catch {
+		return;
+	}
+}
+
+
 function formatDuration(ms: number): string {
 	if (ms < 1000) return `${ms}ms`;
 	if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
@@ -813,6 +891,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 const configArg = process.argv[2];
 if (configArg) {
+	const runStart = Date.now();
 	try {
 		const configJson = fs.readFileSync(configArg, "utf-8");
 		const config = JSON.parse(configJson) as SubagentRunConfig;
@@ -822,10 +901,12 @@ if (configArg) {
 			// Temp config cleanup is best effort.
 		}
 		runSubagent(config).catch((runErr) => {
+			writeFatalResult(config, runErr, runStart);
 			console.error("Subagent runner error:", runErr);
 			process.exit(1);
 		});
 	} catch (err) {
+		writeFatalResultFromConfigArg(configArg, err, runStart);
 		console.error("Subagent runner error:", err);
 		process.exit(1);
 	}
@@ -836,13 +917,16 @@ if (configArg) {
 		input += chunk;
 	});
 	process.stdin.on("end", () => {
+		const runStart = Date.now();
 		try {
 			const config = JSON.parse(input) as SubagentRunConfig;
 			runSubagent(config).catch((runErr) => {
+				writeFatalResult(config, runErr, runStart);
 				console.error("Subagent runner error:", runErr);
 				process.exit(1);
 			});
 		} catch (err) {
+			writeFatalResultFromConfigText(input, err, runStart);
 			console.error("Subagent runner error:", err);
 			process.exit(1);
 		}

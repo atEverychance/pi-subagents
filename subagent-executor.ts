@@ -36,6 +36,7 @@ import {
 	DEFAULT_ARTIFACT_CONFIG,
 	MAX_CONCURRENCY,
 	MAX_PARALLEL,
+	RESULTS_DIR,
 	checkSubagentDepth,
 	wrapForkTask,
 } from "./types.js";
@@ -256,10 +257,12 @@ function persistSyncCompletion(
 		&& details.results.length > 0
 		&& details.results.every((entry) => entry.exitCode === 0);
 	const timestamp = Date.now();
+	const receiptId = `sync-${data.runId}`;
 	const receiptPath = path.join(data.sessionRoot, "completion-receipt.json");
+	const resultPath = path.join(RESULTS_DIR, `${receiptId}.json`);
 
 	const payload = {
-		id: null,
+		id: receiptId,
 		agent: resolveCompletionAgent(params, details),
 		success,
 		...(cancelled ? { cancelled: true } : {}),
@@ -283,6 +286,13 @@ function persistSyncCompletion(
 		fs.writeFileSync(receiptPath, JSON.stringify(payload, null, 2), "utf-8");
 	} catch {
 		// Best effort: completion events should still be emitted even if receipt persistence fails.
+	}
+
+	try {
+		fs.mkdirSync(RESULTS_DIR, { recursive: true });
+		fs.writeFileSync(resultPath, JSON.stringify(payload, null, 2), "utf-8");
+	} catch {
+		// Best effort: the direct event below still provides immediate completion signaling.
 	}
 
 	deps.pi.events.emit("subagent:complete", payload);

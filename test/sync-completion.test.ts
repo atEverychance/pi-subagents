@@ -1,6 +1,8 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { MockPi } from "./helpers.ts";
 import { createMockPi, createTempDir, removeTempDir, tryImport } from "./helpers.ts";
 
@@ -63,6 +65,16 @@ describe("sync completion notifications", { skip: !available ? "subagent executo
 
 	afterEach(() => {
 		removeTempDir(tempDir);
+		const resultsDir = path.join(os.tmpdir(), "pi-async-subagent-results");
+		if (fs.existsSync(resultsDir)) {
+			for (const file of fs.readdirSync(resultsDir)) {
+				if (file.startsWith("sync-") && file.endsWith(".json")) {
+					try {
+						fs.unlinkSync(path.join(resultsDir, file));
+					} catch {}
+				}
+			}
+		}
 	});
 
 	function makeExecutor(emitted: EmittedEvent[]) {
@@ -128,6 +140,8 @@ describe("sync completion notifications", { skip: !available ? "subagent executo
 		assert.equal(events[0]?.cancelled, undefined);
 		assert.equal(typeof events[0]?.receiptPath, "string");
 		assert.equal(fs.existsSync(events[0]?.receiptPath), true);
+		const resultPath = path.join(os.tmpdir(), "pi-async-subagent-results", `${events[0]?.id}.json`);
+		assert.equal(fs.existsSync(resultPath), true);
 
 		const receipt = JSON.parse(fs.readFileSync(events[0].receiptPath, "utf-8"));
 		assert.equal(receipt.executionMode, "sync");
@@ -163,6 +177,7 @@ describe("sync completion notifications", { skip: !available ? "subagent executo
 		assert.equal(events[0]?.cancelled, true);
 		assert.equal(events[0]?.exitCode, 130);
 		assert.equal(fs.existsSync(events[0]?.receiptPath), true);
+		assert.equal(fs.existsSync(path.join(os.tmpdir(), "pi-async-subagent-results", `${events[0]?.id}.json`)), true);
 	});
 
 	it("emits failure completion receipts when sync execution throws", async () => {
@@ -194,6 +209,7 @@ describe("sync completion notifications", { skip: !available ? "subagent executo
 		assert.equal(events[0]?.cancelled, undefined);
 		assert.equal(events[0]?.executionMode, "sync");
 		assert.equal(fs.existsSync(events[0]?.receiptPath), true);
+		assert.equal(fs.existsSync(path.join(os.tmpdir(), "pi-async-subagent-results", `${events[0]?.id}.json`)), true);
 
 		const receipt = JSON.parse(fs.readFileSync(events[0].receiptPath, "utf-8"));
 		assert.equal(receipt.success, false);
