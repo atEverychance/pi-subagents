@@ -235,6 +235,11 @@ function writeFatalResult(config: SubagentRunConfig, error: unknown, startedAt: 
 			...(config.taskIndex !== undefined && { taskIndex: config.taskIndex }),
 			...(config.totalTasks !== undefined && { totalTasks: config.totalTasks }),
 		});
+		// Mark result as written so the process-level exit guard does not emit a duplicate.
+		const marker = (process as unknown as Record<string, unknown>).__resultWritten as { mark?: () => void } | undefined;
+		if (marker && typeof marker.mark === "function") {
+			marker.mark();
+		}
 	} catch (writeErr) {
 		console.error(`Failed to write result file ${config.resultPath}:`, writeErr);
 	}
@@ -884,9 +889,83 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				...(totalTasks !== undefined && { totalTasks }),
 			}),
 		);
+		// Mark result as written so the process-level exit guard does not emit a duplicate.
+		const marker = (process as unknown as Record<string, unknown>).__resultWritten as { mark?: () => void } | undefined;
+		if (marker && typeof marker.mark === "function") {
+			marker.mark();
+		}
 	} catch (err) {
 		console.error(`Failed to write result file ${resultPath}:`, err);
 	}
+}
+
+/**
+ * Install a process-level exit guard that ensures result.json is always written.
+ *
+ * Problem: If the process exits without going through the normal result-writing path
+ * (e.g., unhandled rejection, SIGTERM, or an async path that resolves but never
+ * reaches the write), no result.json is left behind and callers (cmux watcher,
+ * reliable-delegate.mjs) treat the run as perpetually "running" until they time out
+ * as stale-runner-missing-terminal-artifacts.
+ *
+ * This guard checks on process exit whether result.json exists for the active run.
+ * If not, it writes a minimal failure payload so that the watcher can transition
+ * the run to a terminal state instead of hanging.
+ */
+function installResultGuard(resultPath: string, id: string, asyncDir: string, cwd: string, startedAt: number): void {
+	// Track whether the normal path has already written result.json.
+	// This flag is set inside runSubagent just after the successful write.
+	let resultWritten = false;
+
+	// Expose a setter so runSubagent can mark completion without coupling to this guard.
+	(process as unknown as Record<string, unknown>).__resultWritten = {
+		mark: () => { resultWritten = true; },
+	};
+
+	const writeGuardResult = () => {
+		if (resultWritten) return;
+		if (!resultPath) return;
+		try {
+			// If result.json already exists (e.g., writeFatalResult wrote it), don't overwrite.
+			if (fs.existsSync(resultPath)) return;
+			const now = Date.now();
+			writeJson(resultPath, {
+				id,
+				agent: "runner",
+				success: false,
+				summary: "Subagent runner exited without writing result; process-level guard emitted fallback payload.",
+				results: [],
+				error: "silent_exit_no_result_written",
+				exitCode: 1,
+				timestamp: now,
+				durationMs: now - startedAt,
+				truncated: false,
+				asyncDir,
+				cwd,
+			});
+			// Also update status.json if it exists so the state machine can transition.
+			const statusPath = path.join(asyncDir, "status.json");
+			if (fs.existsSync(statusPath)) {
+				try {
+					const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+					if (status.state === "running" || status.state === "queued") {
+						status.state = "failed";
+						status.endedAt = now;
+						status.lastUpdate = now;
+						status.error = "silent_exit_no_result_written";
+						writeJson(statusPath, status);
+					}
+			} catch {
+					// Status update is best effort.
+				}
+			}
+			console.error(`[result-guard] Wrote fallback result.json at ${resultPath} — runner exited without result.`);
+		} catch (guardErr) {
+			console.error(`[result-guard] Failed to write fallback result: ${guardErr}`);
+		}
+	};
+
+	process.on("exit", writeGuardResult);
 }
 
 const configArg = process.argv[2];
@@ -900,6 +979,7 @@ if (configArg) {
 		} catch {
 			// Temp config cleanup is best effort.
 		}
+		installResultGuard(config.resultPath, config.id, config.asyncDir, config.cwd, runStart);
 		runSubagent(config).catch((runErr) => {
 			writeFatalResult(config, runErr, runStart);
 			console.error("Subagent runner error:", runErr);
@@ -920,6 +1000,7 @@ if (configArg) {
 		const runStart = Date.now();
 		try {
 			const config = JSON.parse(input) as SubagentRunConfig;
+			installResultGuard(config.resultPath, config.id, config.asyncDir, config.cwd, runStart);
 			runSubagent(config).catch((runErr) => {
 				writeFatalResult(config, runErr, runStart);
 				console.error("Subagent runner error:", runErr);
