@@ -237,13 +237,33 @@ function resolveCompletionAgent(
 	return params.agent ?? null;
 }
 
+interface SyncCompletionPayload {
+	id: string;
+	agent: string | null;
+	success: boolean;
+	cancelled?: true;
+	executionMode: "sync";
+	summary: string;
+	exitCode: number;
+	timestamp: number;
+	sessionId?: string;
+	cwd: string;
+	sessionFile?: string;
+	receiptPath: string;
+	results: Array<{
+		agent: string;
+		success: boolean;
+		output: string;
+	}>;
+}
+
 function persistSyncCompletion(
 	deps: ExecutorDeps,
 	data: ExecutionContextData,
 	ctx: ExtensionContext,
 	params: SubagentParamsLike,
 	result: AgentToolResult<Details>,
-): { receiptPath: string } | null {
+): { receiptPath: string; completion: SyncCompletionPayload } | null {
 	const details = result.details;
 	if (!details || details.mode === "management" || details.asyncId || details.asyncDir) return null;
 
@@ -260,12 +280,12 @@ function persistSyncCompletion(
 	const receiptId = `sync-${data.runId}`;
 	const receiptPath = path.join(data.sessionRoot, "completion-receipt.json");
 
-	const payload = {
+	const payload: SyncCompletionPayload = {
 		id: receiptId,
 		agent: resolveCompletionAgent(params, details),
 		success,
 		...(cancelled ? { cancelled: true } : {}),
-		executionMode: "sync" as const,
+		executionMode: "sync",
 		summary,
 		exitCode: cancelled ? 130 : (success ? 0 : 1),
 		timestamp,
@@ -286,7 +306,7 @@ function persistSyncCompletion(
 	} catch {
 		// Best effort: foreground completions still return through the active tool result.
 	}
-	return { receiptPath };
+	return { receiptPath, completion: payload };
 }
 
 function applyCompactSyncCloseout(
@@ -1006,6 +1026,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			let finalized = result;
 			if (!effectiveAsync) {
 				const persisted = persistSyncCompletion(deps, execData, ctx, params, finalized);
+				if (persisted?.completion) {
+					try {
+						deps.pi.events.emit("subagent:complete", persisted.completion);
+					} catch {
+						// Best effort: completion receipts and tool output remain authoritative.
+					}
+				}
 				finalized = applyCompactSyncCloseout(finalized, persisted?.receiptPath);
 			}
 			return withForkContext(finalized, params.context);

@@ -45,6 +45,31 @@ function makeState(cwd: string) {
 	};
 }
 
+function findCompletionReceiptPath(rootDir: string): string | null {
+	const stack = [rootDir];
+	while (stack.length > 0) {
+		const current = stack.pop()!;
+		for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+			const entryPath = path.join(current, entry.name);
+			if (entry.isDirectory()) {
+				stack.push(entryPath);
+				continue;
+			}
+			if (entry.isFile() && entry.name === "completion-receipt.json") {
+				return entryPath;
+			}
+		}
+	}
+	return null;
+}
+
+function loadCompletionReceipt(rootDir: string): { receiptPath: string; receipt: any } {
+	const receiptPath = findCompletionReceiptPath(rootDir);
+	assert.ok(receiptPath, "Expected sync completion-receipt.json to be written");
+	const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf-8"));
+	return { receiptPath, receipt };
+}
+
 describe("sync completion receipts", { skip: !available ? "subagent executor not importable" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
@@ -119,7 +144,7 @@ describe("sync completion receipts", { skip: !available ? "subagent executor not
 		return emitted.filter((event) => event.type === "subagent:complete").map((event) => event.payload);
 	}
 
-	it("writes one sync completion receipt for successful single runs", async () => {
+	it("writes one sync completion receipt and emits canonical completion for successful single runs", async () => {
 		mockPi.onCall({ output: "done" });
 		const emitted: EmittedEvent[] = [];
 		const executor = makeExecutor(emitted);
@@ -135,20 +160,24 @@ describe("sync completion receipts", { skip: !available ? "subagent executor not
 		assert.equal(result.isError, undefined);
 		assert.match(result.content[0]?.text ?? "", /^Subagent echo completed\./);
 		const events = completionEvents(emitted);
-		assert.equal(events.length, 0);
-		const receiptPath = path.join(tempDir, "completion-receipt.json");
-		assert.equal(fs.existsSync(receiptPath), true);
-		const resultPath = path.join(os.tmpdir(), "pi-async-subagent-results", `sync-id.json`);
+		assert.equal(events.length, 1);
+		assert.equal(events[0]?.executionMode, "sync");
+		assert.equal(events[0]?.success, true);
+		assert.equal(events[0]?.summary, "done");
+		assert.match(events[0]?.id ?? "", /^sync-/);
+
+		const resultPath = path.join(os.tmpdir(), "pi-async-subagent-results", "sync-id.json");
 		assert.equal(fs.existsSync(resultPath), false);
 
-		const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf-8"));
+		const { receiptPath, receipt } = loadCompletionReceipt(tempDir);
 		assert.equal(receipt.executionMode, "sync");
 		assert.equal(receipt.success, true);
 		assert.equal(receipt.summary, "done");
 		assert.equal(receipt.receiptPath, receiptPath);
+		assert.equal(events[0]?.receiptPath, receiptPath);
 	});
 
-	it("marks cancelled clarify flows as cancelled instead of successful", async () => {
+	it("marks cancelled clarify flows as cancelled and emits canonical sync completion", async () => {
 		const emitted: EmittedEvent[] = [];
 		const executor = makeExecutor(emitted);
 		const ctx = makeCtx({
@@ -167,21 +196,27 @@ describe("sync completion receipts", { skip: !available ? "subagent executor not
 		);
 
 		assert.equal(result.isError, undefined);
-		assert.match(result.content[0]?.text ?? "", /^Subagent echo cancelled\./);
+		assert.equal(result.content[0]?.text ?? "", "Cancelled");
 		assert.equal(mockPi.callCount(), 0);
 
 		const events = completionEvents(emitted);
-		assert.equal(events.length, 0);
-		const receiptPath = path.join(tempDir, "completion-receipt.json");
-		assert.equal(fs.existsSync(receiptPath), true);
-		const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf-8"));
+		assert.equal(events.length, 1);
+		assert.equal(events[0]?.executionMode, "sync");
+		assert.equal(events[0]?.success, false);
+		assert.equal(events[0]?.cancelled, true);
+		assert.equal(events[0]?.exitCode, 130);
+		assert.equal(events[0]?.summary, "Cancelled");
+		assert.match(events[0]?.id ?? "", /^sync-/);
+
+		assert.equal(fs.existsSync(path.join(os.tmpdir(), "pi-async-subagent-results", "sync-id.json")), false);
+		const { receiptPath, receipt } = loadCompletionReceipt(tempDir);
 		assert.equal(receipt.success, false);
 		assert.equal(receipt.cancelled, true);
 		assert.equal(receipt.exitCode, 130);
-		assert.equal(fs.existsSync(path.join(os.tmpdir(), "pi-async-subagent-results", `sync-id.json`)), false);
+		assert.equal(events[0]?.receiptPath, receiptPath);
 	});
 
-	it("emits failure completion receipts when sync execution throws", async () => {
+	it("emits canonical failure completion receipts when sync execution throws", async () => {
 		const emitted: EmittedEvent[] = [];
 		const executor = makeExecutor(emitted);
 		const ctx = makeCtx({
@@ -202,17 +237,20 @@ describe("sync completion receipts", { skip: !available ? "subagent executor not
 		);
 
 		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /^Subagent echo failed\./);
-		assert.match(result.content[0]?.text ?? "", /ui exploded/);
+		assert.equal(result.content[0]?.text ?? "", "ui exploded");
 
 		const events = completionEvents(emitted);
-		assert.equal(events.length, 0);
-		const receiptPath = path.join(tempDir, "completion-receipt.json");
-		assert.equal(fs.existsSync(receiptPath), true);
-		assert.equal(fs.existsSync(path.join(os.tmpdir(), "pi-async-subagent-results", `sync-id.json`)), false);
+		assert.equal(events.length, 1);
+		assert.equal(events[0]?.executionMode, "sync");
+		assert.equal(events[0]?.success, false);
+		assert.equal(events[0]?.exitCode, 1);
+		assert.match(events[0]?.summary ?? "", /ui exploded/);
+		assert.match(events[0]?.id ?? "", /^sync-/);
 
-		const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf-8"));
+		assert.equal(fs.existsSync(path.join(os.tmpdir(), "pi-async-subagent-results", "sync-id.json")), false);
+		const { receiptPath, receipt } = loadCompletionReceipt(tempDir);
 		assert.equal(receipt.success, false);
 		assert.match(receipt.summary, /ui exploded/);
+		assert.equal(events[0]?.receiptPath, receiptPath);
 	});
 });
