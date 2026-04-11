@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { appendJsonl, getArtifactPaths } from "./artifacts.js";
 import { getPiSpawnCommand } from "./pi-spawn.js";
 import { persistSingleOutput } from "./single-output.js";
@@ -368,6 +368,41 @@ interface SingleStepContext {
 }
 
 /** Run a single pi agent step, returning output and metadata */
+export function validateRequiredOutput(outputPath: string, output: string): { ok: true; savedPath: string } | { ok: false; error: string } {
+	if (!output.trim()) {
+		return {
+			ok: false,
+			error: `Agent completed without producing required text output for ${outputPath}`,
+		};
+	}
+	const persisted = persistSingleOutput(outputPath, output);
+	if (!persisted.savedPath) {
+		return {
+			ok: false,
+			error: persisted.error
+				? `Failed to save required output to: ${outputPath}\n${persisted.error}`
+				: `Failed to save required output to: ${outputPath}`,
+		};
+	}
+	try {
+		const saved = fs.readFileSync(persisted.savedPath, "utf-8");
+		if (!saved.trim()) {
+			return {
+				ok: false,
+				error: `Required output file was created but empty: ${persisted.savedPath}`,
+			};
+		}
+	} catch (err) {
+		return {
+			ok: false,
+			error: err instanceof Error
+				? `Failed to verify required output at: ${persisted.savedPath}\n${err.message}`
+				: `Failed to verify required output at: ${persisted.savedPath}`,
+		};
+	}
+	return { ok: true, savedPath: persisted.savedPath };
+}
+
 async function runSingleStep(
 	step: SubagentStep,
 	ctx: SingleStepContext,
@@ -414,15 +449,20 @@ async function runSingleStep(
 	const output = (result.stdout || "").trim();
 	let outputForSummary = output;
 	if (step.outputPath && result.exitCode === 0) {
-		const persisted = persistSingleOutput(step.outputPath, output);
-		if (persisted.savedPath) {
+		const requiredOutput = validateRequiredOutput(step.outputPath, output);
+		if (requiredOutput.ok) {
 			outputForSummary = output
-				? `${output}\n\n📄 Output saved to: ${persisted.savedPath}`
-				: `📄 Output saved to: ${persisted.savedPath}`;
-		} else if (persisted.error) {
+				? `${output}
+
+📄 Output saved to: ${requiredOutput.savedPath}`
+				: `📄 Output saved to: ${requiredOutput.savedPath}`;
+		} else {
+			result.exitCode = 1;
 			outputForSummary = output
-				? `${output}\n\n⚠️ Failed to save output to: ${step.outputPath}\n${persisted.error}`
-				: `⚠️ Failed to save output to: ${step.outputPath}\n${persisted.error}`;
+				? `${output}
+
+⚠️ ${requiredOutput.error}`
+				: `⚠️ ${requiredOutput.error}`;
 		}
 	}
 
@@ -968,29 +1008,42 @@ function installResultGuard(resultPath: string, id: string, asyncDir: string, cw
 	process.on("exit", writeGuardResult);
 }
 
-const configArg = process.argv[2];
-if (configArg) {
-	const runStart = Date.now();
+function isCliEntrypoint(): boolean {
+	const entryArg = process.argv[1];
+	if (!entryArg) return false;
 	try {
-		const configJson = fs.readFileSync(configArg, "utf-8");
-		const config = JSON.parse(configJson) as SubagentRunConfig;
-		try {
-			fs.unlinkSync(configArg);
-		} catch {
-			// Temp config cleanup is best effort.
-		}
-		installResultGuard(config.resultPath, config.id, config.asyncDir, config.cwd, runStart);
-		runSubagent(config).catch((runErr) => {
-			writeFatalResult(config, runErr, runStart);
-			console.error("Subagent runner error:", runErr);
-			process.exit(1);
-		});
-	} catch (err) {
-		writeFatalResultFromConfigArg(configArg, err, runStart);
-		console.error("Subagent runner error:", err);
-		process.exit(1);
+		return path.resolve(entryArg) === fileURLToPath(import.meta.url);
+	} catch {
+		return false;
 	}
-} else {
+}
+
+function main(): void {
+	const configArg = process.argv[2];
+	if (configArg) {
+		const runStart = Date.now();
+		try {
+			const configJson = fs.readFileSync(configArg, "utf-8");
+			const config = JSON.parse(configJson) as SubagentRunConfig;
+			try {
+				fs.unlinkSync(configArg);
+			} catch {
+				// Temp config cleanup is best effort.
+			}
+			installResultGuard(config.resultPath, config.id, config.asyncDir, config.cwd, runStart);
+			runSubagent(config).catch((runErr) => {
+				writeFatalResult(config, runErr, runStart);
+				console.error("Subagent runner error:", runErr);
+				process.exit(1);
+			});
+		} catch (err) {
+			writeFatalResultFromConfigArg(configArg, err, runStart);
+			console.error("Subagent runner error:", err);
+			process.exit(1);
+		}
+		return;
+	}
+
 	let input = "";
 	process.stdin.setEncoding("utf-8");
 	process.stdin.on("data", (chunk) => {
@@ -1012,4 +1065,8 @@ if (configArg) {
 			process.exit(1);
 		}
 	});
+}
+
+if (isCliEntrypoint()) {
+	main();
 }
