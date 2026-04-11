@@ -517,33 +517,37 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						}
 					: undefined,
 			});
+
+			// Validate expected output file was created
+			if (behavior.output && r.exitCode === 0) {
+				try {
+					const expectedPath = path.isAbsolute(behavior.output)
+						? behavior.output
+						: path.join(chainDir, behavior.output);
+					if (!fs.existsSync(expectedPath)) {
+						const dirFiles = fs.readdirSync(chainDir);
+						const mdFiles = dirFiles.filter((f) => f.endsWith(".md") && f !== "progress.md");
+						const missingOutputError = mdFiles.length > 0
+							? `Expected output file missing: ${behavior.output} (agent wrote ${mdFiles.join(", ")})`
+							: `Expected output file missing: ${behavior.output}`;
+						r.exitCode = 1;
+						r.error = r.error ? `${r.error}\n${missingOutputError}` : missingOutputError;
+						if (r.progress) {
+							r.progress.status = "failed";
+							r.progress.error = r.error;
+						}
+					}
+				} catch {
+					// Ignore validation errors - this is just a diagnostic
+				}
+			}
+
 			recordRun(seqStep.agent, cleanTask, r.exitCode, r.progressSummary?.durationMs ?? 0);
 
 			globalTaskIndex++;
 			results.push(r);
 			if (r.progress) allProgress.push(r.progress);
 			if (r.artifactPaths) allArtifactPaths.push(r.artifactPaths);
-
-			// Validate expected output file was created
-			if (behavior.output && r.exitCode === 0) {
-				try {
-					const expectedPath = path.isAbsolute(behavior.output)
-						? behavior.output 
-						: path.join(chainDir, behavior.output);
-					if (!fs.existsSync(expectedPath)) {
-						// Look for similar files that might have been created instead
-						const dirFiles = fs.readdirSync(chainDir);
-						const mdFiles = dirFiles.filter(f => f.endsWith(".md") && f !== "progress.md");
-						const warning = mdFiles.length > 0 
-							? `Agent wrote to different file(s): ${mdFiles.join(", ")} instead of ${behavior.output}`
-							: `Agent did not create expected output file: ${behavior.output}`;
-						// Add warning to result but don't fail
-						r.error = r.error ? `${r.error}\n⚠️ ${warning}` : `⚠️ ${warning}`;
-					}
-				} catch {
-					// Ignore validation errors - this is just a diagnostic
-				}
-			}
 
 			// On failure, leave chain_dir for debugging
 			if (r.exitCode !== 0) {

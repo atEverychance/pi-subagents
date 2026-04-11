@@ -73,6 +73,8 @@ function loadCompletionReceipt(rootDir: string): { receiptPath: string; receipt:
 describe("sync completion receipts", { skip: !available ? "subagent executor not importable" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
+	let savedSubagentDepth: string | undefined;
+	let savedSubagentMaxDepth: string | undefined;
 
 	before(() => {
 		mockPi = createMockPi();
@@ -86,10 +88,18 @@ describe("sync completion receipts", { skip: !available ? "subagent executor not
 	beforeEach(() => {
 		tempDir = createTempDir("pi-subagent-sync-completion-");
 		mockPi.reset();
+		savedSubagentDepth = process.env.PI_SUBAGENT_DEPTH;
+		savedSubagentMaxDepth = process.env.PI_SUBAGENT_MAX_DEPTH;
+		process.env.PI_SUBAGENT_DEPTH = "0";
+		delete process.env.PI_SUBAGENT_MAX_DEPTH;
 	});
 
 	afterEach(() => {
 		removeTempDir(tempDir);
+		if (savedSubagentDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = savedSubagentDepth;
+		if (savedSubagentMaxDepth === undefined) delete process.env.PI_SUBAGENT_MAX_DEPTH;
+		else process.env.PI_SUBAGENT_MAX_DEPTH = savedSubagentMaxDepth;
 		const resultsDir = path.join(os.tmpdir(), "pi-async-subagent-results");
 		if (fs.existsSync(resultsDir)) {
 			for (const file of fs.readdirSync(resultsDir)) {
@@ -174,6 +184,47 @@ describe("sync completion receipts", { skip: !available ? "subagent executor not
 		assert.equal(receipt.success, true);
 		assert.equal(receipt.summary, "done");
 		assert.equal(receipt.receiptPath, receiptPath);
+		assert.equal(events[0]?.receiptPath, receiptPath);
+	});
+
+	it("marks provider-surfaced assistant errors as failed in sync completion receipts", async () => {
+		mockPi.onCall({
+			jsonl: [
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Provider failure" }],
+						errorMessage: "Provider overloaded",
+						model: "mock/test-model",
+						usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+					},
+				},
+			],
+		});
+		const emitted: EmittedEvent[] = [];
+		const executor = makeExecutor(emitted);
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "echo", task: "say done" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Provider overloaded/);
+		const events = completionEvents(emitted);
+		assert.equal(events.length, 1);
+		assert.equal(events[0]?.success, false);
+		assert.equal(events[0]?.exitCode, 1);
+		assert.match(events[0]?.summary ?? "", /Provider overloaded/);
+
+		const { receiptPath, receipt } = loadCompletionReceipt(tempDir);
+		assert.equal(receipt.success, false);
+		assert.equal(receipt.exitCode, 1);
+		assert.match(receipt.summary, /Provider overloaded/);
 		assert.equal(events[0]?.receiptPath, receiptPath);
 	});
 

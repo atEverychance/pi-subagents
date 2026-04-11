@@ -128,6 +128,7 @@ export async function runSync(
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv() };
 
 	let closeJsonlWriter: (() => Promise<void>) | undefined;
+	let sawAssistantErrorMessage = false;
 	const exitCode = await new Promise<number>((resolve) => {
 		const spawnSpec = getPiSpawnCommand(args);
 		const proc = spawn(spawnSpec.command, spawnSpec.args, {
@@ -230,7 +231,10 @@ export async function runSync(
 							progress.tokens = result.usage.input + result.usage.output;
 						}
 						if (!result.model && evt.message.model) result.model = evt.message.model;
-						if (evt.message.errorMessage) result.error = evt.message.errorMessage;
+						if (evt.message.errorMessage) {
+							sawAssistantErrorMessage = true;
+							result.error = evt.message.errorMessage;
+						}
 
 						const text = extractTextFromContent(evt.message.content);
 						if (text) {
@@ -318,7 +322,9 @@ export async function runSync(
 	cleanupTempDir(tempDir);
 	result.exitCode = exitCode;
 
-	if (exitCode === 0 && !result.error) {
+	if (exitCode === 0 && sawAssistantErrorMessage) {
+		result.exitCode = 1;
+	} else if (exitCode === 0 && !result.error) {
 		const errInfo = detectSubagentError(result.messages);
 		if (errInfo.hasError) {
 			result.exitCode = errInfo.exitCode ?? 1;

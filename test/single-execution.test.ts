@@ -86,6 +86,30 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.ok(result.error?.includes("Something went wrong"));
 	});
 
+	it("fails when assistant surfaces an errorMessage despite process exit 0", async () => {
+		mockPi.onCall({
+			jsonl: [
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Provider failure" }],
+						errorMessage: "Provider overloaded",
+						model: "mock/test-model",
+						usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+					},
+				},
+			],
+		});
+		const agents = makeAgentConfigs(["fail"]);
+
+		const result = await runSync(tempDir, agents, "fail", "Do something", {});
+
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.error, "Provider overloaded");
+		assert.equal(result.progress.status, "failed");
+	});
+
 	it("handles long tasks via temp file (ENAMETOOLONG prevention)", async () => {
 		mockPi.onCall({ output: "Got it" });
 		const longTask = "Analyze ".repeat(2000); // ~16KB

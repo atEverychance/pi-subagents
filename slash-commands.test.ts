@@ -98,7 +98,7 @@ function createCommandContext() {
 }
 
 describe("slash command custom message delivery", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
-	it("/run sends an inline slash result message after a successful bridge response", async () => {
+	it("/run emits a visible live slash result plus a hidden finalized snapshot on success", async () => {
 		const sent: unknown[] = [];
 		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
 		const events = createEventBus();
@@ -129,17 +129,30 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		registerSlashCommands!(pi, createState(process.cwd()));
 		await commands.get("run")!.handler("scout inspect this", createCommandContext());
 
-		assert.deepEqual(sent, [
-			{
-				customType: SLASH_RESULT_TYPE,
-				content: "Scout finished",
-				display: true,
-				details: { mode: "single", results: [] },
+		assert.equal(sent.length, 2);
+		const visible = sent[0] as { customType: string; content: string; display: boolean; details: { requestId: string; result: unknown } };
+		const hidden = sent[1] as { customType: string; content: string; display: boolean; details: { requestId: string; result: unknown } };
+
+		assert.equal(visible.customType, SLASH_RESULT_TYPE);
+		assert.equal(visible.content, "inspect this");
+		assert.equal(visible.display, true);
+		assert.equal(typeof visible.details.requestId, "string");
+
+		assert.deepEqual(hidden, {
+			customType: SLASH_RESULT_TYPE,
+			content: "Scout finished",
+			display: false,
+			details: {
+				requestId: visible.details.requestId,
+				result: {
+					content: [{ type: "text", text: "Scout finished" }],
+					details: { mode: "single", results: [] },
+				},
 			},
-		]);
+		});
 	});
 
-	it("/run still sends an inline slash result message when the bridge returns an error", async () => {
+	it("/run emits a visible live slash result plus a hidden finalized snapshot on error", async () => {
 		const sent: unknown[] = [];
 		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
 		const events = createEventBus();
@@ -171,13 +184,26 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		registerSlashCommands!(pi, createState(process.cwd()));
 		await commands.get("run")!.handler("scout inspect this", createCommandContext());
 
-		assert.deepEqual(sent, [
-			{
-				customType: SLASH_RESULT_TYPE,
-				content: "Subagent failed",
-				display: true,
-				details: { mode: "single", results: [] },
+		assert.equal(sent.length, 2);
+		const visible = sent[0] as { customType: string; content: string; display: boolean; details: { requestId: string; result: unknown } };
+		const hidden = sent[1] as { customType: string; content: string; display: boolean; details: { requestId: string; result: unknown } };
+
+		assert.equal(visible.customType, SLASH_RESULT_TYPE);
+		assert.equal(visible.content, "inspect this");
+		assert.equal(visible.display, true);
+		assert.equal(typeof visible.details.requestId, "string");
+
+		assert.deepEqual(hidden, {
+			customType: SLASH_RESULT_TYPE,
+			content: "Subagent failed",
+			display: false,
+			details: {
+				requestId: visible.details.requestId,
+				result: {
+					content: [{ type: "text", text: "Subagent failed" }],
+					details: { mode: "single", results: [] },
+				},
 			},
-		]);
+		});
 	});
 });

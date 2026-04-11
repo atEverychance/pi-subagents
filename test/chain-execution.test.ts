@@ -158,6 +158,26 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		assert.equal(result.details.results[0].exitCode, 1);
 	});
 
+	it("fails the chain when a declared sequential output file is missing", async () => {
+		mockPi.onCall({ output: "Draft complete" });
+		const agents = [makeAgent("writer"), makeAgent("reviewer")];
+
+		const result = await executeChain(
+			makeChainParams(
+				[
+					{ agent: "writer", task: "Draft the report", output: "report.md" },
+					{ agent: "reviewer" },
+				],
+				agents,
+			),
+		);
+
+		assert.ok(result.isError, "chain should fail when expected output is missing");
+		assert.equal(result.details.results.length, 1, "next step should not run");
+		assert.equal(result.details.results[0].exitCode, 1);
+		assert.match(result.details.results[0].error ?? "", /Expected output file missing: report\.md/);
+	});
+
 	it("runs a 3-step chain end-to-end", async () => {
 		mockPi.onCall({ output: "Step output" });
 		const agents = [makeAgent("scout"), makeAgent("planner"), makeAgent("executor")];
