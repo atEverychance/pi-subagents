@@ -178,6 +178,54 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		assert.match(result.details.results[0].error ?? "", /Expected output file missing: report\.md/);
 	});
 
+	it("fails fast when a later step reads a chain artifact no earlier step produces", async () => {
+		const agents = [
+			makeAgent("pm", { output: "brief.md" }),
+			makeAgent("planner", { output: "plan.md", defaultReads: ["context.md"] }),
+		];
+
+		const result = await executeChain(
+			makeChainParams(
+				[
+					{ agent: "pm", task: "Write the brief" },
+					{ agent: "planner", task: "Plan the work" },
+				],
+				agents,
+			),
+		);
+
+		assert.ok(result.isError, "chain should fail during contract preflight");
+		assert.equal(result.details.results.length, 0, "no step should run when contract preflight fails");
+		assert.equal(result.details.currentStepIndex, 1, "should point at the invalid planner step");
+		assert.equal(mockPi.callCount(), 0, "pi should not be invoked when chain contract preflight fails");
+		assert.match(result.content[0].text, /chain-input-contract-mismatch/);
+		assert.match(result.content[0].text, /step 2 \(planner\) reads context\.md/);
+	});
+
+	it("fails fast when two steps claim the same output path", async () => {
+		const agents = [
+			makeAgent("pm", { output: "brief.md" }),
+			makeAgent("writer", { output: "brief.md" }),
+		];
+
+		const result = await executeChain(
+			makeChainParams(
+				[
+					{ agent: "pm", task: "Write the brief" },
+					{ agent: "writer", task: "Rewrite the brief" },
+				],
+				agents,
+			),
+		);
+
+		assert.ok(result.isError, "chain should fail during contract preflight");
+		assert.equal(result.details.results.length, 0, "no step should run when output contracts collide");
+		assert.equal(result.details.currentStepIndex, 1, "should point at the colliding step");
+		assert.equal(mockPi.callCount(), 0, "pi should not be invoked when output contracts collide");
+		assert.match(result.content[0].text, /chain-output-contract-mismatch/);
+		assert.match(result.content[0].text, /step 2 \(writer\) reuses output brief\.md/);
+	});
+
 	it("runs a 3-step chain end-to-end", async () => {
 		mockPi.onCall({ output: "Step output" });
 		const agents = [makeAgent("scout"), makeAgent("planner"), makeAgent("executor")];

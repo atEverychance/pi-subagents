@@ -155,6 +155,8 @@ interface AgentConfig {
 	output?: string | false;
 	reads?: string[] | false;
 	progress?: boolean;
+	defaultReads?: string[] | false;
+	defaultProgress?: boolean;
 	mcpDirectTools?: string[];
 }
 

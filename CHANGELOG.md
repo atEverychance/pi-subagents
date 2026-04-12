@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+- Chain execution now fails fast on structurally invalid handoffs before any child runs start. In particular, later steps whose relative `reads` are not satisfied by earlier outputs now return a `chain-input-contract-mismatch`, and duplicate output targets across chain steps now return a `chain-output-contract-mismatch` instead of surfacing later as vague missing-output errors.
+- Async chain launch now applies the same preflight contract checks before creating the async run dir or spawning the runner, and async chain step instructions now use the same read/output/progress chain artifact semantics as sync execution.
+
 ## [0.11.11] - 2026-03-23
 
 ### Changed

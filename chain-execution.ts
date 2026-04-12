@@ -60,6 +60,136 @@ function resolveModelFullId(modelName: string | undefined, availableModels: Mode
 	return modelName;
 }
 
+interface ChainContractIssue {
+	kind: "chain-input-contract-mismatch" | "chain-output-contract-mismatch";
+	stepIndex: number;
+	agent: string;
+	error: string;
+}
+
+function normalizeChainRelativePath(filePath: string): string {
+	return path.normalize(filePath).replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function collectChainDirFiles(dir: string, rootDir = dir, acc = new Set<string>()): Set<string> {
+	if (!fs.existsSync(dir)) return acc;
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const fullPath = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			collectChainDirFiles(fullPath, rootDir, acc);
+			continue;
+		}
+		acc.add(normalizeChainRelativePath(path.relative(rootDir, fullPath)));
+	}
+	return acc;
+}
+
+function formatChainFileList(files: Iterable<string>): string {
+	const list = [...new Set(files)].filter(Boolean).sort();
+	return list.length > 0 ? list.join(", ") : "(none)";
+}
+
+export function validateChainContract(
+	chainSteps: ChainStep[],
+	agents: AgentConfig[],
+	chainDir: string,
+	chainSkills: string[],
+	tuiBehaviorOverrides?: (BehaviorOverride | undefined)[],
+): ChainContractIssue | null {
+	const availableFiles = collectChainDirFiles(chainDir);
+	const declaredOutputs = new Map<string, { stepIndex: number; agent: string }>();
+
+	const checkReads = (
+		reads: string[] | false,
+		availableNow: Set<string>,
+		stepIndex: number,
+		agentName: string,
+	): ChainContractIssue | null => {
+		if (!reads || reads.length === 0) return null;
+		const missingReads = reads
+			.filter((readPath) => !path.isAbsolute(readPath))
+			.map((readPath) => normalizeChainRelativePath(readPath))
+			.filter((readPath) => !availableNow.has(readPath));
+		if (missingReads.length === 0) return null;
+		return {
+			kind: "chain-input-contract-mismatch",
+			stepIndex,
+			agent: agentName,
+			error: `chain-input-contract-mismatch: step ${stepIndex + 1} (${agentName}) reads ${missingReads.join(", ")}, but earlier chain artifacts only provide ${formatChainFileList(availableNow)}. Override reads/output explicitly or change the chain shape.`,
+		};
+	};
+
+	const registerOutput = (
+		output: string | false,
+		stepIndex: number,
+		agentName: string,
+	): ChainContractIssue | null => {
+		if (!output) return null;
+		const outputKey = path.isAbsolute(output)
+			? `abs:${path.normalize(output).replace(/\\/g, "/")}`
+			: `rel:${normalizeChainRelativePath(output)}`;
+		const prior = declaredOutputs.get(outputKey);
+		if (prior) {
+			const displayPath = path.isAbsolute(output) ? path.normalize(output) : normalizeChainRelativePath(output);
+			return {
+				kind: "chain-output-contract-mismatch",
+				stepIndex,
+				agent: agentName,
+				error: `chain-output-contract-mismatch: step ${stepIndex + 1} (${agentName}) reuses output ${displayPath}, already claimed by step ${prior.stepIndex + 1} (${prior.agent}). Give each chain step a distinct output path or disable one output contract.`,
+			};
+		}
+		declaredOutputs.set(outputKey, { stepIndex, agent: agentName });
+		if (!path.isAbsolute(output)) {
+			availableFiles.add(normalizeChainRelativePath(output));
+		}
+		return null;
+	};
+
+	for (let stepIndex = 0; stepIndex < chainSteps.length; stepIndex++) {
+		const step = chainSteps[stepIndex]!;
+		if (isParallelStep(step)) {
+			const parallelBehaviors = resolveParallelBehaviors(step.parallel, agents, stepIndex, chainSkills);
+			const availableNow = new Set(availableFiles);
+			if (parallelBehaviors.some((behavior) => behavior.progress)) {
+				availableNow.add("progress.md");
+			}
+			for (let taskIndex = 0; taskIndex < step.parallel.length; taskIndex++) {
+				const task = step.parallel[taskIndex]!;
+				const behavior = parallelBehaviors[taskIndex]!;
+				const readIssue = checkReads(behavior.reads, availableNow, stepIndex, task.agent);
+				if (readIssue) return readIssue;
+				const outputIssue = registerOutput(behavior.output, stepIndex, task.agent);
+				if (outputIssue) return outputIssue;
+			}
+			if (parallelBehaviors.some((behavior) => behavior.progress)) {
+				availableFiles.add("progress.md");
+			}
+			continue;
+		}
+
+		const seqStep = step as SequentialStep;
+		const agentConfig = agents.find((agent) => agent.name === seqStep.agent);
+		if (!agentConfig) continue;
+		const tuiOverride = tuiBehaviorOverrides?.[stepIndex];
+		const stepOverride: StepOverrides = {
+			output: tuiOverride?.output !== undefined ? tuiOverride.output : seqStep.output,
+			reads: tuiOverride?.reads !== undefined ? tuiOverride.reads : seqStep.reads,
+			progress: tuiOverride?.progress !== undefined ? tuiOverride.progress : seqStep.progress,
+			skills: tuiOverride?.skills !== undefined ? tuiOverride.skills : normalizeSkillInput(seqStep.skill),
+		};
+		const behavior = resolveStepBehavior(agentConfig, stepOverride, chainSkills);
+		const readIssue = checkReads(behavior.reads, availableFiles, stepIndex, seqStep.agent);
+		if (readIssue) return readIssue;
+		const outputIssue = registerOutput(behavior.output, stepIndex, seqStep.agent);
+		if (outputIssue) return outputIssue;
+		if (behavior.progress) {
+			availableFiles.add("progress.md");
+		}
+	}
+
+	return null;
+}
+
 export interface ChainExecutionParams {
 	chain: ChainStep[];
 	task?: string;
@@ -246,6 +376,25 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		templates = result.templates;
 		// Store behavior overrides from TUI (used below in sequential step execution)
 		tuiBehaviorOverrides = result.behaviorOverrides;
+	}
+
+	const contractIssue = validateChainContract(chainSteps, agents, chainDir, chainSkills, tuiBehaviorOverrides);
+	if (contractIssue) {
+		const summary = buildChainSummary(chainSteps, [], chainDir, "failed", {
+			index: contractIssue.stepIndex,
+			error: contractIssue.error,
+		});
+		return {
+			content: [{ type: "text", text: summary }],
+			details: {
+				mode: "chain",
+				results: [],
+				chainAgents,
+				totalSteps,
+				currentStepIndex: contractIssue.stepIndex,
+			},
+			isError: true,
+		};
 	}
 
 	// Execute chain (handles both sequential and parallel steps)

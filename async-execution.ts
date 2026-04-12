@@ -12,9 +12,19 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AgentConfig } from "./agents.js";
 import { applyThinkingSuffix } from "./pi-args.js";
 import { injectSingleOutputInstruction, resolveSingleOutputPath } from "./single-output.js";
-import { isParallelStep, resolveStepBehavior, type ChainStep, type SequentialStep, type StepOverrides } from "./settings.js";
+import {
+	buildChainInstructions,
+	createChainDir,
+	isParallelStep,
+	resolveParallelBehaviors,
+	resolveStepBehavior,
+	type ChainStep,
+	type SequentialStep,
+	type StepOverrides,
+} from "./settings.js";
 import type { RunnerStep } from "./parallel-utils.js";
 import { resolvePiPackageRoot } from "./pi-spawn.js";
+import { validateChainContract } from "./chain-execution.js";
 import { buildSkillInjection, normalizeSkillInput, resolveSkills } from "./skills.js";
 import {
 	type ArtifactConfig,
@@ -222,6 +232,15 @@ export function executeAsyncChain(
 		sessionFilesByFlatIndex,
 	} = params;
 	const chainSkills = params.chainSkills ?? [];
+	const chainAgents = chain.map((step) =>
+		isParallelStep(step)
+			? `[${step.parallel.map((task) => task.agent).join("+")}]`
+			: (step as SequentialStep).agent,
+	);
+	const totalSteps = chain.length;
+	const chainDesc = chainAgents.join(" -> ");
+	const asyncDir = path.join(ASYNC_DIR, id);
+	const chainDir = path.join(asyncDir, "chain");
 
 	// Validate all agents exist before building steps
 	for (const s of chain) {
@@ -233,30 +252,54 @@ export function executeAsyncChain(
 				return {
 					content: [{ type: "text", text: `Unknown agent: ${agentName}` }],
 					isError: true,
-					details: { mode: "chain" as const, results: [] },
+					details: { mode: "chain" as const, results: [], chainAgents, totalSteps },
 				};
 			}
 		}
 	}
 
-	const asyncDir = path.join(ASYNC_DIR, id);
+	const contractIssue = validateChainContract(chain, agents, chainDir, chainSkills);
+	if (contractIssue) {
+		return {
+			content: [{ type: "text", text: `❌ Async chain blocked before launch: ${contractIssue.error}` }],
+			isError: true,
+			details: {
+				mode: "chain" as const,
+				results: [],
+				chainAgents,
+				totalSteps,
+				currentStepIndex: contractIssue.stepIndex,
+			},
+		};
+	}
+
 	try {
 		fs.mkdirSync(asyncDir, { recursive: true });
+		createChainDir("chain", asyncDir);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return {
 			content: [{ type: "text", text: `Failed to create async run directory '${asyncDir}': ${message}` }],
 			isError: true,
-			details: { mode: "chain" as const, results: [] },
+			details: { mode: "chain" as const, results: [], chainAgents, totalSteps },
 		};
 	}
 
-	/** Build a resolved runner step from a SequentialStep */
-	const buildSeqStep = (s: SequentialStep, sessionFile?: string) => {
+	let progressCreated = false;
+	let flatStepIndex = 0;
+	const nextSessionFile = (): string | undefined => {
+		const sessionFile = sessionFilesByFlatIndex?.[flatStepIndex];
+		flatStepIndex++;
+		return sessionFile;
+	};
+
+	const buildRunnerStep = (
+		s: SequentialStep,
+		behavior: ReturnType<typeof resolveStepBehavior>,
+		sessionFile: string | undefined,
+		isFirstProgress: boolean,
+	): RunnerStep => {
 		const a = agents.find((x) => x.name === s.agent)!;
-		const stepSkillInput = normalizeSkillInput(s.skill);
-		const stepOverrides: StepOverrides = { skills: stepSkillInput };
-		const behavior = resolveStepBehavior(a, stepOverrides, chainSkills);
 		const skillNames = behavior.skills === false ? [] : behavior.skills;
 		const { resolved: resolvedSkills } = resolveSkills(skillNames, ctx.cwd);
 
@@ -266,10 +309,16 @@ export function executeAsyncChain(
 			systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
 		}
 
-		// Resolve output path and inject instruction into task
-		// Use step's cwd if specified, otherwise fall back to chain-level cwd
-		const outputPath = resolveSingleOutputPath(s.output, ctx.cwd, s.cwd ?? cwd);
-		const task = injectSingleOutputInstruction(s.task ?? "{previous}", outputPath);
+		const taskTemplate = s.task ?? "{previous}";
+		const templateHasPrevious = taskTemplate.includes("{previous}");
+		const { prefix, suffix } = buildChainInstructions(
+			behavior,
+			chainDir,
+			isFirstProgress,
+			templateHasPrevious ? undefined : "{previous}",
+		);
+		const outputPath = resolveSingleOutputPath(behavior.output, chainDir, chainDir);
+		const task = injectSingleOutputInstruction(prefix + taskTemplate + suffix, outputPath);
 
 		return {
 			agent: s.agent,
@@ -286,39 +335,46 @@ export function executeAsyncChain(
 		};
 	};
 
-	let flatStepIndex = 0;
-	const nextSessionFile = (): string | undefined => {
-		const sessionFile = sessionFilesByFlatIndex?.[flatStepIndex];
-		flatStepIndex++;
-		return sessionFile;
-	};
-
 	// Build runner steps — sequential steps become flat objects,
 	// parallel steps become { parallel: [...], concurrency?, failFast? }
-	const steps: RunnerStep[] = chain.map((s) => {
+	const steps: RunnerStep[] = chain.map((s, stepIndex) => {
 		if (isParallelStep(s)) {
+			const parallelBehaviors = resolveParallelBehaviors(s.parallel, agents, stepIndex, chainSkills);
+			const anyNeedsProgress = parallelBehaviors.some((behavior) => behavior.progress);
+			if (anyNeedsProgress && !progressCreated) {
+				fs.writeFileSync(path.join(chainDir, "progress.md"), "# Progress\n\n## Status\nIn Progress\n\n## Tasks\n\n## Files Changed\n\n## Notes\n", "utf-8");
+				progressCreated = true;
+			}
 			return {
-				parallel: s.parallel.map((t) => buildSeqStep({
-					agent: t.agent,
-					task: t.task,
-					cwd: t.cwd,
-					skill: t.skill,
-					model: t.model,
-					output: t.output,
-				}, nextSessionFile())),
+				parallel: s.parallel.map((task, taskIndex) =>
+					buildRunnerStep(
+						{
+							agent: task.agent,
+							task: task.task,
+							cwd: task.cwd,
+							skill: task.skill,
+							model: task.model,
+							output: task.output,
+						},
+						parallelBehaviors[taskIndex]!,
+						nextSessionFile(),
+						false,
+					),
+				),
 				concurrency: s.concurrency,
 				failFast: s.failFast,
 			};
 		}
-		return buildSeqStep(s as SequentialStep, nextSessionFile());
+		const seqStep = s as SequentialStep;
+		const stepSkillInput = normalizeSkillInput(seqStep.skill);
+		const stepOverrides: StepOverrides = { skills: stepSkillInput };
+		const behavior = resolveStepBehavior(agents.find((x) => x.name === seqStep.agent)!, stepOverrides, chainSkills);
+		const isFirstProgress = behavior.progress && !progressCreated;
+		if (isFirstProgress) {
+			progressCreated = true;
+		}
+		return buildRunnerStep(seqStep, behavior, nextSessionFile(), isFirstProgress);
 	});
-
-	// Build chain description with parallel groups shown as [agent1+agent2]
-	const chainDesc = chain
-		.map((s) =>
-			isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : (s as SequentialStep).agent,
-		)
-		.join(" -> ");
 
 	const runnerCwd = cwd ?? ctx.cwd;
 	const spawned = spawnRunner(
