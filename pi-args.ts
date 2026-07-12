@@ -51,10 +51,11 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	const modelArg = applyThinkingSuffix(input.model, input.thinking);
 	if (modelArg) {
-		// Use --models (not --model) because pi CLI silently ignores --model
-		// without a companion --provider flag. --models resolves the provider
-		// automatically via resolveModelScope. See: #8
-		args.push("--models", modelArg);
+		// Use --model so non-interactive subagent runs actually start on the
+		// requested model. Modern pi resolves provider/model IDs directly here;
+		// --models only constrains the cycle list and can leave the active model
+		// on the parent/default provider.
+		args.push("--model", modelArg);
 	}
 
 	const toolExtensionPaths: string[] = [];

@@ -3,6 +3,20 @@ import { describe, it } from "node:test";
 import { buildPiArgs } from "./pi-args.ts";
 
 describe("buildPiArgs session wiring", () => {
+	it("uses --model for the active subagent model", () => {
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"],
+			task: "hello",
+			sessionEnabled: false,
+			model: "openai-codex/gpt-5.6-luna",
+			thinking: "medium",
+		});
+
+		assert.ok(args.includes("--model"));
+		assert.ok(args.includes("openai-codex/gpt-5.6-luna:medium"));
+		assert.ok(!args.includes("--models"), "--models only changes the cycle list, not the active model");
+	});
+
 	it("uses --session when sessionFile is provided", () => {
 		const { args } = buildPiArgs({
 			baseArgs: ["-p"],
